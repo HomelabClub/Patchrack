@@ -33,7 +33,7 @@ You need Docker with the Compose plugin on the machine that runs Patchrack. It r
 ### 1. Get the files
 
 ```bash
-git clone https://github.com/OWNER/patchrack.git
+git clone https://github.com/HomelabClub/patchrack.git
 cd patchrack
 ```
 
@@ -67,7 +67,7 @@ docker compose up -d --build
 
 Open `http://<docker-host>:8080` and create your account.
 
-To use the ready-made image instead of building it yourself, replace `build: .` in `docker-compose.yml` with `image: ghcr.io/OWNER/patchrack:latest`. Images are published for `amd64` and `arm64` (Raspberry Pi 4 and 5).
+To use the ready-made image instead of building it yourself, replace `build: .` in `docker-compose.yml` with `image: ghcr.io/HomelabClub/patchrack:latest`. Images are published for `amd64` and `arm64` (Raspberry Pi 4 and 5).
 
 ## Add your servers
 
