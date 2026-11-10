@@ -1,0 +1,10 @@
+secrets/
+data/
+**/__pycache__
+*.pyc
+.git
+README.md
+tests/
+.github/
+.pytest_cache/
+requirements-dev.txt

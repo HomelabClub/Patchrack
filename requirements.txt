@@ -1,0 +1,9 @@
+fastapi==0.162.3
+starlette==1.7.0
+pydantic==2.13.5
+uvicorn[standard]==0.54.0
+asyncssh==2.24.1
+cryptography==50.0.1
+httpx==0.28.1
+itsdangerous==2.2.0
+python-multipart==0.0.32

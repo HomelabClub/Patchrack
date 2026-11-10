@@ -1,0 +1,24 @@
+services:
+  patchrack:
+    build: .
+    image: patchrack:latest
+    container_name: patchrack
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      TZ: Europe/Amsterdam
+      PATCHRACK_SECRET_FILE: /run/secrets/patchrack_secret
+      # Set to "true" when Patchrack sits behind an HTTPS reverse proxy
+      COOKIE_SECURE: "false"
+    secrets:
+      - patchrack_secret
+    volumes:
+      - patchrack-data:/data
+
+secrets:
+  patchrack_secret:
+    file: ./secrets/patchrack_secret
+
+volumes:
+  patchrack-data:
