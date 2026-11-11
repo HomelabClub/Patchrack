@@ -8,3 +8,5 @@ tests/
 .github/
 .pytest_cache/
 requirements-dev.txt
+backups/
+scripts/

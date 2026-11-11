@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.2 (2026-11-11)
+
+A safe way to update Patchrack.
+
+- New update script for Linux, `scripts/update.sh`. Run it from the new release and it backs up your files and data, copies the new files over (keeping `secrets/`, `backups/` and your own `docker-compose.override.yml`), builds the new version while the current one keeps running, and checks that it starts. If anything fails, it restores the previous version and data automatically.
+- The README has a new "Updating Patchrack" section, including steps for Windows, keeping your own settings in `docker-compose.override.yml`, and restoring a backup by hand.
+- Each GitHub release now includes a ready-to-download `Patchrack_vX.Y.Z.zip`.
+
 ## 0.1.1 (2026-11-11)
 
 Fixes scheduled notifications that weren't arriving.

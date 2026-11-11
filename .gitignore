@@ -3,3 +3,6 @@ data/
 __pycache__/
 *.pyc
 .pytest_cache/
+backups/
+docker-compose.override.yml
+docker-compose.yml.new

@@ -1,0 +1,6 @@
+# Keep Linux line endings for files that run on Linux, also when committing from Windows
+* text=auto
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.py text eol=lf
+*.yml text eol=lf

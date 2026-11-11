@@ -1,5 +1,6 @@
-# Publishes the Docker image to GitHub Container Registry when a version tag is pushed,
-# for example: git tag v0.1.0 && git push origin v0.1.0
+# When a version tag is pushed (for example: git tag v0.1.2 && git push origin v0.1.2) this
+# runs the tests, publishes the Docker image to GitHub Container Registry, and creates a
+# GitHub release with Patchrack_vX.Y.Z.zip attached and the changelog as release notes.
 name: Release
 
 on:
@@ -7,7 +8,7 @@ on:
     tags: ["v*.*.*"]
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -15,6 +16,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Check that the tag matches the version in the app
+        run: |
+          version=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' app/main.py)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match VERSION = \"$version\" in app/main.py"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -45,3 +54,12 @@ jobs:
             PATCHRACK_SOURCE_URL=${{ github.server_url }}/${{ github.repository }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Build the release zip
+        run: git archive --format=zip --prefix=patchrack/ -o "Patchrack_v${VERSION}.zip" HEAD
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          awk '/^## /{n++} n==1' CHANGELOG.md | tail -n +2 > release-notes.md
+          gh release create "$GITHUB_REF_NAME" "Patchrack_v${VERSION}.zip" \
+            --title "Patchrack ${VERSION}" --notes-file release-notes.md

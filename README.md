@@ -32,6 +32,15 @@ You need Docker with the Compose plugin on the machine that runs Patchrack. It r
 
 ### 1. Get the files
 
+Download the newest `Patchrack_vX.Y.Z.zip` from the [Releases page](../../releases/latest) and unpack it. It contains a `patchrack` folder; this is your Patchrack folder from now on.
+
+```bash
+unzip Patchrack_v0.1.2.zip
+cd patchrack
+```
+
+Or clone the repository instead:
+
 ```bash
 git clone https://github.com/HomelabClub/patchrack.git
 cd patchrack
@@ -128,6 +137,99 @@ Patchrack doesn't change your compose files. Rootless Docker and Podman aren't s
 
 Scheduled checks send one summary message when new updates appear, not one per server. Container updates get their own message, which you can turn off separately.
 
+## Updating Patchrack
+
+Updates don't touch your data. Your account, servers, settings and Patchrack's SSH key live in the Docker volume, and the master secret stays in `secrets/`. The version you run is shown at the bottom of the Settings page, and [CHANGELOG.md](CHANGELOG.md) lists what changed.
+
+### Linux: the update script (recommended)
+
+1. Download the new `Patchrack_vX.Y.Z.zip` from the [Releases page](../../releases/latest) to the server. From Windows you can copy it over with `scp Patchrack_v0.1.2.zip you@server:~`.
+2. Unpack it into a separate folder, next to your installation:
+
+   ```bash
+   cd ~
+   rm -rf patchrack-update
+   unzip -q Patchrack_v0.1.2.zip -d patchrack-update
+   ```
+
+3. Run the update script from the new release, and give it your Patchrack folder:
+
+   ```bash
+   bash patchrack-update/patchrack/scripts/update.sh ~/patchrack
+   ```
+
+   It shows which version you have and which you'll get, and asks before it changes anything. If Docker needs `sudo` on your server, put `sudo` in front of the command.
+
+4. When it says `Done: Patchrack 0.1.2 is running`, clean up:
+
+   ```bash
+   rm -rf ~/patchrack-update ~/Patchrack_v0.1.2.zip
+   ```
+
+What the script does:
+
+1. Saves your current Patchrack files and a copy of the data in `backups/` in your Patchrack folder. It keeps the five most recent backups.
+2. Copies the new files over. It never touches `secrets/`, `backups/` or `docker-compose.override.yml`.
+3. Builds the new version while the current one keeps running, so Patchrack is only offline for a minute.
+4. Starts the new version and checks that it answers.
+
+If anything fails along the way, the script puts everything back as it was, including the data, and starts the previous version again. If the build itself fails, the running version isn't stopped at all.
+
+Always run the script from the **new** release, not the copy inside your installation, so the newest update logic is used.
+
+### Keep your own changes in docker-compose.override.yml
+
+If you change settings such as the port or the time zone, put them in a file called `docker-compose.override.yml` next to `docker-compose.yml`. Docker Compose reads both, and updates never overwrite the override file. For example:
+
+```yaml
+services:
+  patchrack:
+    ports: !override
+      - "9090:8080"
+    environment:
+      TZ: Europe/London
+```
+
+`!override` replaces the port list instead of adding to it (Docker Compose 2.24.4 or newer).
+
+If you edited `docker-compose.yml` itself, the update script keeps your file and saves the new one as `docker-compose.yml.new`. Move your changes into the override file and replace `docker-compose.yml` with the new one.
+
+### Windows (Docker Desktop)
+
+In PowerShell, in your Patchrack folder:
+
+```powershell
+# 1. Back up the data
+docker run --rm --user 0 -v patchrack_patchrack-data:/data -v "${PWD}\backups:/backup" patchrack:latest tar czf /backup/data-before-update.tgz -C /data .
+
+# 2. Unpack the new release over your installation
+Expand-Archive "$env:USERPROFILE\Downloads\Patchrack_v0.1.2.zip" -DestinationPath "$env:TEMP\patchrack-update" -Force
+Copy-Item "$env:TEMP\patchrack-update\patchrack\*" . -Recurse -Force
+
+# 3. Build and start the new version
+docker compose up -d --build
+```
+
+The volume name starts with your folder's name: `docker volume ls` shows it.
+
+### Other ways to update
+
+- **You installed with git clone:** `git pull`, then `docker compose up -d --build`.
+- **You use the ready-made image:** `docker compose pull`, then `docker compose up -d`.
+
+### Restore a backup by hand
+
+The update script restores backups by itself when an update fails. To go back later, run the update script from the older release's zip, or restore a backup from `backups/` by hand:
+
+```bash
+cd ~/patchrack
+docker compose stop
+tar -xzf backups/patchrack-0.1.1-<date>-files.tgz -C .
+docker run --rm --user 0 -v patchrack_patchrack-data:/data -v "$PWD/backups:/backup:ro" patchrack:latest \
+  sh -c 'find /data -mindepth 1 -delete && tar -xzf /backup/patchrack-0.1.1-<date>-data.tgz -C /data'
+docker compose up -d --build
+```
+
 ## Security
 
 - **Secrets at rest:** SSH private keys, key passphrases, sudo passwords and notification tokens are encrypted with AES-256-GCM. The key comes from the master secret, which is kept outside the database. Each value is bound to its record, so encrypted values can't be swapped between servers.
@@ -154,7 +256,7 @@ If neither secret variable is set, Patchrack generates `/data/.master.key` and l
 
 ## Backups
 
-Back up the `patchrack-data` volume and `secrets/patchrack_secret`, and store them separately.
+Back up the `patchrack-data` volume and `secrets/patchrack_secret`, and store them separately. The update script also saves a backup in `backups/` before every update, but that folder sits on the same machine.
 
 ```bash
 docker run --rm -v patchrack_patchrack-data:/data -v "$PWD":/backup busybox \
@@ -173,6 +275,7 @@ docker run --rm -v patchrack_patchrack-data:/data -v "$PWD":/backup busybox \
 | Docker installed, no access | Docker was installed after setup. Run the setup command again, then press Check. |
 | Docker not running | Start it on the server with `sudo systemctl start docker`, then press Check. |
 | A container shows "Can't check" | Its registry needs a login, or the tag no longer exists. Update it by hand. |
+| The update script can't reach Docker | Run it with `sudo`, or add your user to the `docker` group. |
 | Packages stay "held back" | apt keeps them back (phased updates on Ubuntu, or a held package). Patchrack shows them but doesn't count them as pending. |
 
 ## Alternatives
