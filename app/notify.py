@@ -3,7 +3,9 @@
 """Push notifications through Pushover and Prowl."""
 from __future__ import annotations
 
+import json
 import logging
+import time
 import xml.etree.ElementTree as ET
 
 import httpx
@@ -74,7 +76,25 @@ async def send(title: str, message: str, priority: int = 0, only: str | None = N
     return results
 
 
+LABELS = {"pushover": "Pushover", "prowl": "Prowl"}
+
+
+def enabled_channels() -> list[str]:
+    return [name for name in CHANNELS if db.get_setting(f"{name}_enabled")]
+
+
+def record(kind: str, title: str, message: str, results: dict | None, note: str | None = None) -> None:
+    """Keep the last 100 notifications, so Settings can show what was sent and why not."""
+    db.ex("INSERT INTO notifications(at, kind, title, message, results, note) VALUES(?,?,?,?,?,?)",
+          (time.time(), kind, title, message, json.dumps(results or {}), note))
+    db.ex("DELETE FROM notifications WHERE id NOT IN (SELECT id FROM notifications ORDER BY id DESC LIMIT 100)")
+
+
 async def event(kind: str, title: str, message: str, priority: int = 0) -> None:
-    """Send if the user enabled this kind of event."""
-    if db.get_setting(f"notify_{kind}"):
-        await send(title, message, priority)
+    """Send if the user enabled this kind of event, and log the outcome either way."""
+    if not db.get_setting(f"notify_{kind}"):
+        record(kind, title, message, None, "Not sent: this kind of message is turned off in Settings.")
+        return
+    results = await send(title, message, priority)
+    note = None if results else "Not sent: Pushover and Prowl are both switched off."
+    record(kind, title, message, results, note)

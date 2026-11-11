@@ -69,7 +69,7 @@ function toast(msg, kind = "ok") {
   el.className = "toast";
   el.innerHTML = `<span class="led ${kind}"></span><span>${esc(msg)}</span>`;
   $("#toasts").append(el);
-  setTimeout(() => el.remove(), kind === "bad" ? 7000 : 4200);
+  setTimeout(() => el.remove(), kind === "ok" ? 4200 : 8000);
 }
 
 async function copyText(text) {
@@ -926,6 +926,23 @@ async function openLog(r) {
 }
 
 /* ---------- settings ---------- */
+async function loadNotificationLog() {
+  const box = $("#nlog");
+  if (!box) return;
+  let rows;
+  try { rows = await api("GET", "/api/notifications"); } catch (err) { box.innerHTML = `<p class="error-text">${esc(err.message)}</p>`; return; }
+  if (!rows.length) { box.innerHTML = `<p class="muted">No messages yet. Use Send test, or wait for the next scheduled check.</p>`; return; }
+  const LABEL = { pushover: "Pushover", prowl: "Prowl" };
+  box.innerHTML = `<div class="nlog">${rows.map((r) => {
+    const res = Object.entries(r.results || {});
+    const allOk = res.length && res.every(([, v]) => v[0]);
+    const led = r.note ? "" : allOk ? "ok" : res.some(([, v]) => v[0]) ? "warn" : "bad";
+    const detail = r.note ? esc(r.note) : res.map(([k, v]) => `${LABEL[k] || k}: ${v[0] ? "sent" : `<span class="bad-text">${esc(v[1])}</span>`}`).join(", ");
+    return `<div class="nrow"><span class="led ${led}"></span><div><b>${esc(r.title)}</b> <span class="muted">${esc(fmtTime(r.at))}</span>
+      ${r.message ? `<div class="nmsg">${esc(r.message.split("\n").join(", "))}</div>` : ""}<div class="ndetail">${detail}</div></div></div>`;
+  }).join("")}</div>`;
+}
+
 async function renderSettings() {
   const main = $("#main");
   main.innerHTML = `<div class="page-head"><div><h1>Settings</h1></div></div><div class="settings" id="st"><div class="card"><p class="muted">Loading…</p></div></div>`;
@@ -939,10 +956,18 @@ async function renderSettings() {
     <input id="${id}" type="password" autocomplete="off" placeholder="${has ? "Saved and encrypted. Leave empty to keep." : ""}">
     ${hint ? `<span class="hint">${hint}</span>` : ""}</div>`;
   const hours = [1, 3, 6, 12, 24, 168];
+  const when = (ts) => {
+    const d = new Date(ts * 1000), today = new Date();
+    const time = d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+    return d.toDateString() === today.toDateString() ? time : d.toLocaleDateString(undefined, { weekday: "long" }) + " " + time;
+  };
+  const schedText = !st.schedule_enabled ? "Switched off. Patchrack only checks when you press Check."
+    : `${st.last_scheduled_check ? `Last check ${ago(st.last_scheduled_check)}.` : "Hasn't run yet."} Next check around ${when(st.next_scheduled_check)}.`;
+  const remind = [["daily", "Once a day"], ["every", "After every scheduled check"], ["never", "Don't remind me"]];
   $("#st").innerHTML = `
     <section class="card">
-      <header><h2>Automatic checks</h2><p>Patchrack looks for updates on a schedule. It never installs anything without you pressing Update.</p></header>
-      ${sw("s-sched", st.schedule_enabled, "Check on a schedule", st.last_scheduled_check ? `Last scheduled check ${ago(st.last_scheduled_check)}.` : "Hasn't run yet.")}
+      <header><h2>Automatic checks</h2><p>Patchrack looks for updates on a schedule. It never installs anything without you pressing Update. Checks only run while the computer running Patchrack is switched on and awake.</p></header>
+      ${sw("s-sched", st.schedule_enabled, "Check on a schedule", schedText)}
       <div class="row-even">
         <div class="field"><label for="s-int">Check every</label><select id="s-int">
           ${hours.map((h) => `<option value="${h}" ${+st.check_interval_hours === h ? "selected" : ""}>${h === 168 ? "week" : h === 24 ? "day" : plural(h, "hour")}</option>`).join("")}
@@ -956,12 +981,15 @@ async function renderSettings() {
     <section class="card">
       <header><h2>Notifications</h2><p>Get a push message on your phone. Keys are encrypted before they're stored.</p></header>
       <div class="subcard">
-        ${sw("n-found", st.notify_updates_found, "New updates found", "From scheduled checks, one summary message.")}
+        ${sw("n-found", st.notify_updates_found, "System updates available", "From scheduled checks, one message for all servers.")}
         ${sw("n-done", st.notify_update_done, "Update finished", "")}
         ${sw("n-fail", st.notify_update_failed, "Update failed", "Sent with high priority.")}
-        ${sw("n-cont", st.notify_container_updates, "Container updates found", "From scheduled checks, when containers have newer images.")}
+        ${sw("n-cont", st.notify_container_updates, "Container updates available", "From scheduled checks, when containers have newer images.")}
         ${sw("n-unr", st.notify_unreachable, "Server unreachable", "When a scheduled check can't connect.")}
       </div>
+      <div class="field" style="max-width:calc(50% - 6px)"><label for="n-rem">Remind me about waiting updates</label><select id="n-rem">
+        ${remind.map(([v, t]) => `<option value="${v}" ${(st.notify_reminder || "daily") === v ? "selected" : ""}>${t}</option>`).join("")}</select>
+        <span class="hint">New updates are always reported at the next scheduled check. Reminders repeat the list while updates are waiting.</span></div>
       <div class="subcard">
         ${sw("po-on", st.pushover_enabled, "Pushover", "Create an application at pushover.net to get a token.")}
         <div class="row-even">${secret("po-token", st.has_pushover_token, "Application API token")}${secret("po-user", st.has_pushover_user, "User key")}</div>
@@ -976,6 +1004,11 @@ async function renderSettings() {
         <span class="hint">Added as a link to notifications.</span></div>
     </section>
     <div class="acts" style="display:flex;justify-content:flex-end"><button class="btn primary" id="saveSettings">Save settings</button></div>
+
+    <section class="card">
+      <header><h2>Recent messages</h2><p>What Patchrack sent, and the answer from Pushover and Prowl. If something wasn't sent, the reason is shown here.</p></header>
+      <div id="nlog"><p class="muted">Loading…</p></div>
+    </section>
 
     <section class="card">
       <header><h2>Patchrack SSH key</h2><p>The key Patchrack uses to sign in to your servers. The private half never leaves Patchrack and is stored encrypted.</p></header>
@@ -1000,6 +1033,7 @@ async function renderSettings() {
     reboot_timeout_min: +$("#s-rto").value || 10,
     notify_updates_found: $("#n-found").checked, notify_update_done: $("#n-done").checked,
     notify_update_failed: $("#n-fail").checked, notify_unreachable: $("#n-unr").checked, notify_container_updates: $("#n-cont").checked,
+    notify_reminder: $("#n-rem").value,
     pushover_enabled: $("#po-on").checked, pushover_token: $("#po-token").value.trim() || null, pushover_user: $("#po-user").value.trim() || null,
     prowl_enabled: $("#pr-on").checked, prowl_apikey: $("#pr-key").value.trim() || null, app_url: $("#s-url").value.trim(),
   });
@@ -1007,10 +1041,18 @@ async function renderSettings() {
   $("#saveSettings").onclick = async () => { try { await saveAll(); renderSettings(); } catch (err) { toast(err.message, "bad"); } };
   $$("[data-test]").forEach((b) => (b.onclick = async () => {
     b.disabled = true; b.textContent = "Sending…";
-    try { await saveAll(true); const r = await api("POST", "/api/notify/test", { channel: b.dataset.test }); toast(r.ok ? `Test sent through ${b.dataset.test === "pushover" ? "Pushover" : "Prowl"}` : r.message, r.ok ? "ok" : "bad"); }
-    catch (err) { toast(err.message, "bad"); }
+    const name = b.dataset.test === "pushover" ? "Pushover" : "Prowl";
+    try {
+      await saveAll(true);
+      const r = await api("POST", "/api/notify/test", { channel: b.dataset.test });
+      if (!r.ok) toast(r.message, "bad");
+      else if (!r.enabled) toast(`Test sent, but ${name} is switched off, so Patchrack won't send it real notifications. Turn on the ${name} switch and save.`, "warn");
+      else toast(`Test sent through ${name}`);
+    } catch (err) { toast(err.message, "bad"); }
     b.disabled = false; b.textContent = "Send test";
+    loadNotificationLog();
   }));
+  loadNotificationLog();
   $$("[data-clear]").forEach((b) => (b.onclick = async () => { await api("POST", "/api/settings/clear-secret", { key: b.dataset.clear }); toast("Removed"); renderSettings(); }));
   $("#copySetup").onclick = () => copyText(key.setup_script);
   $("#copyPub").onclick = () => copyText(key.public_key);

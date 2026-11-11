@@ -71,6 +71,15 @@ CREATE TABLE IF NOT EXISTS history (
     finished_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_history_started ON history(started_at DESC);
+CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY,
+    at REAL NOT NULL,
+    kind TEXT NOT NULL,
+    title TEXT,
+    message TEXT,
+    results TEXT,               -- {"pushover": [ok, detail], ...}
+    note TEXT                   -- why nothing was sent, if nothing was
+);
 """
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -83,6 +92,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "notify_update_failed": True,
     "notify_unreachable": True,
     "notify_container_updates": True,
+    "notify_reminder": "daily",          # daily | every | never: repeat messages about waiting updates
+    "last_notified_updates_found": 0,
+    "last_notified_container_updates": 0,
     "pushover_enabled": False,
     "pushover_user": "",
     "prowl_enabled": False,

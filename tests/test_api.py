@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Kevin Villarreal (Homelab Club)
 """API tests against the real app with a throwaway database (no servers are contacted)."""
 import subprocess
+import time
 
 import asyncssh
 import pytest
@@ -82,6 +83,30 @@ def test_notification_tokens_are_masked(client):
     text = client.get("/api/settings").text
     assert "tok-123456" not in text and "usr-abcdef" not in text
     assert r.json()["has_pushover_token"] is True
+
+
+def test_send_test_warns_when_the_service_is_switched_off(client, monkeypatch):
+    from app import notify
+
+    async def ok(title, message, priority):
+        return True, "Sent"
+
+    monkeypatch.setitem(notify.CHANNELS, "prowl", ok)
+    s = client.get("/api/settings").json()
+    s.update(prowl_enabled=False, prowl_apikey="key-123")
+    client.put("/api/settings", json=s, headers=H)
+    r = client.post("/api/notify/test", json={"channel": "prowl"}, headers=H).json()
+    assert r["ok"] is True and r["enabled"] is False
+    log = client.get("/api/notifications").json()
+    assert log[0]["title"] == "Patchrack test" and log[0]["results"]["prowl"][0] is True
+
+
+def test_settings_show_next_check_and_reminder(client):
+    s = client.get("/api/settings").json()
+    assert s["notify_reminder"] == "daily"
+    assert s["next_scheduled_check"] >= time.time() - 5
+    s["notify_reminder"] = "sometimes"
+    assert client.put("/api/settings", json=s, headers=H).status_code == 422
 
 
 def test_setup_script_is_valid_and_restricted(client):

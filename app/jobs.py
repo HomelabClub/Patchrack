@@ -439,6 +439,11 @@ manager = JobManager()
 
 
 # ---- scheduler ------------------------------------------------------------------
+# "Once a day" reminders: at most one per 20 hours, so a check that runs a little earlier
+# than yesterday's still counts as the next day
+REMINDER_GAP = 20 * 3600
+
+
 async def run_scheduled_checks(trigger: str = "schedule") -> None:
     rows = db.q("SELECT id, status, pending_count, docker_json FROM servers ORDER BY name")
     before = {r["id"]: (r["status"], r["pending_count"]) for r in rows}
@@ -454,26 +459,46 @@ async def run_scheduled_checks(trigger: str = "schedule") -> None:
     await asyncio.gather(*(j.task for j in jobs if j.task), return_exceptions=True)
     if trigger != "schedule":
         return
-    new_updates, unreachable, new_containers = [], [], []
-    for j in jobs:
-        row = get_server(j.server_id)
-        if row is None:
-            continue
+    checked = {j.server_id for j in jobs}
+    sys_lines, ct_lines, unreachable = [], [], []
+    sys_new = ct_new = False
+    # list everything that is waiting, on every server, and note whether any of it is new
+    for row in db.q("SELECT * FROM servers ORDER BY name COLLATE NOCASE"):
         prev_status, prev_count = before.get(row["id"], ("unknown", 0))
-        if row["status"] == "updates" and (prev_status != "updates" or row["pending_count"] > prev_count):
+        if row["status"] == "updates":
             sec = f", {row['security_count']} security" if row["security_count"] else ""
-            new_updates.append(f"{row['name']}: {row['pending_count']}{sec}")
-        if row["status"] == "unreachable" and prev_status != "unreachable":
+            n = row["pending_count"]
+            sys_lines.append(f"{row['name']}: {n} update{'' if n == 1 else 's'}{sec}")
+            if row["id"] in checked and (prev_status != "updates" or n > prev_count):
+                sys_new = True
+        if row["id"] in checked and row["status"] == "unreachable" and prev_status != "unreachable":
             unreachable.append(row["name"])
         now_c = _container_updates(row["docker_json"])
-        if now_c - containers_before.get(row["id"], set()):
-            new_containers.append(f"{row['name']}: {', '.join(sorted(now_c))}")
-    if new_updates:
-        await notify.event("updates_found", "Updates available", "\n".join(new_updates))
+        if now_c:
+            ct_lines.append(f"{row['name']}: {', '.join(sorted(now_c))}")
+            if row["id"] in checked and now_c - containers_before.get(row["id"], set()):
+                ct_new = True
+    await _announce("updates_found", sys_lines, sys_new, "Updates available", "Updates still waiting")
+    await _announce("container_updates", ct_lines, ct_new, "Container updates available",
+                    "Container updates still waiting")
     if unreachable:
         await notify.event("unreachable", "Servers unreachable", ", ".join(unreachable), 1)
-    if new_containers:
-        await notify.event("container_updates", "Container updates available", "\n".join(new_containers))
+
+
+async def _announce(kind: str, lines: list[str], is_new: bool, title_new: str, title_waiting: str) -> None:
+    """Report waiting updates: right away when something is new, otherwise as a reminder."""
+    if not lines:
+        return
+    mode = db.get_setting("notify_reminder") or "daily"
+    last = float(db.get_setting(f"last_notified_{kind}") or 0)
+    if is_new:
+        title = title_new
+    elif mode == "every" or (mode == "daily" and time.time() - last >= REMINDER_GAP):
+        title = title_waiting
+    else:
+        return
+    await notify.event(kind, title, "\n".join(lines))
+    db.set_setting(f"last_notified_{kind}", time.time())
 
 
 def _container_updates(docker_json: str | None) -> set[str]:
@@ -481,6 +506,15 @@ def _container_updates(docker_json: str | None) -> set[str]:
         return set()
     info = json.loads(docker_json)
     return {c["name"] for c in info.get("containers", []) if c.get("check") == "update"}
+
+
+_scheduled: set[asyncio.Task] = set()
+
+
+def _scheduled_done(task: asyncio.Task) -> None:
+    _scheduled.discard(task)
+    if not task.cancelled() and task.exception():
+        log.error("Scheduled check failed", exc_info=task.exception())
 
 
 async def scheduler_loop() -> None:
@@ -493,7 +527,9 @@ async def scheduler_loop() -> None:
                 if time.time() - last >= hours * 3600:
                     db.set_setting("last_scheduled_check", time.time())
                     log.info("Running scheduled update check")
-                    asyncio.create_task(run_scheduled_checks("schedule"))
+                    task = asyncio.create_task(run_scheduled_checks("schedule"))
+                    _scheduled.add(task)            # keep a reference until it finishes
+                    task.add_done_callback(_scheduled_done)
         except Exception:
             log.exception("scheduler error")
         await asyncio.sleep(60)

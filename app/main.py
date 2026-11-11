@@ -28,7 +28,7 @@ logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
 log = logging.getLogger("patchrack")
 logging.getLogger("asyncssh").setLevel(logging.WARNING)
 STATIC = Path(__file__).parent / "static"
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 # Where the source code of this build lives. AGPL section 13 asks that people using a
 # (modified) copy over the network can get its source, so the app links to it.
 SOURCE_URL = os.environ.get("PATCHRACK_SOURCE_URL", "").strip()
@@ -484,6 +484,7 @@ class SettingsIn(BaseModel):
     notify_update_failed: bool
     notify_unreachable: bool
     notify_container_updates: bool = True
+    notify_reminder: str = Field("daily", pattern="^(daily|every|never)$")
     pushover_enabled: bool
     pushover_token: str | None = None   # empty = keep
     pushover_user: str | None = None
@@ -494,6 +495,7 @@ class SettingsIn(BaseModel):
 
 PLAIN_KEYS = ["schedule_enabled", "check_interval_hours", "max_parallel", "reboot_timeout_min",
               "notify_updates_found", "notify_update_done", "notify_update_failed", "notify_unreachable", "notify_container_updates",
+              "notify_reminder",
               "pushover_enabled", "prowl_enabled", "app_url"]
 
 
@@ -502,7 +504,10 @@ def settings_public() -> dict:
     d["has_pushover_token"] = db.has_setting("pushover_token")
     d["has_pushover_user"] = db.has_setting("pushover_user")
     d["has_prowl_apikey"] = db.has_setting("prowl_apikey")
-    d["last_scheduled_check"] = db.get_setting("last_scheduled_check")
+    last = float(db.get_setting("last_scheduled_check") or 0)
+    d["last_scheduled_check"] = last
+    d["next_scheduled_check"] = (max(last + float(d["check_interval_hours"] or 6) * 3600, time.time())
+                                 if d["schedule_enabled"] else None)
     return d
 
 
@@ -545,7 +550,16 @@ class TestNotify(BaseModel):
 async def test_notify(body: TestNotify, user: str = Depends(user_required)):
     res = await notify.send("Patchrack test", "Notifications from Patchrack are working.", 0, only=body.channel)
     ok, msg = res.get(body.channel, (False, "Not configured"))
-    return {"ok": ok, "message": msg}
+    enabled = bool(db.get_setting(f"{body.channel}_enabled"))
+    notify.record("test", "Patchrack test", f"Test through {notify.LABELS[body.channel]}", res)
+    return {"ok": ok, "message": msg, "enabled": enabled}
+
+
+@app.get("/api/notifications")
+def notification_log(user: str = Depends(user_required)):
+    rows = db.q("SELECT * FROM notifications ORDER BY id DESC LIMIT 30")
+    return [{"at": r["at"], "kind": r["kind"], "title": r["title"], "message": r["message"],
+             "results": json.loads(r["results"] or "{}"), "note": r["note"]} for r in rows]
 
 
 # ---- SSH key & server setup script ------------------------------------------------------

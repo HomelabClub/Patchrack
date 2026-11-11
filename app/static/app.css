@@ -380,3 +380,12 @@ details.disclose > div { padding: 0 12px 12px; display: grid; gap: 12px; }
 
 .about, .auth-card .about { margin: 28px 0 0; font-size: 12.5px; line-height: 1.5; }
 .about a, .settings .muted a { color: var(--muted); }
+
+/* ---------- notification log ---------- */
+.nlog { display: grid; gap: 2px; }
+.nrow { display: grid; grid-template-columns: 14px 1fr; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line-soft); font-size: 13.5px; }
+.nrow:last-child { border-bottom: 0; }
+.nrow .led { width: 8px; height: 8px; margin-top: 6px; }
+.nmsg { color: var(--muted); font-size: 13px; margin-top: 2px; overflow-wrap: anywhere; }
+.ndetail { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+.bad-text { color: var(--red); }
