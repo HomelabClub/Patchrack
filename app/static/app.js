@@ -426,6 +426,7 @@ function detailHTML(s) {
     ${body}
     <div class="acts" style="display:flex;gap:8px;flex-wrap:wrap">
       <button class="btn small" data-act="edit">${ICON.gear}Server settings</button>
+      ${s.key_source === "app" ? `<button class="btn small" data-act="setup">Setup command</button>` : ""}
       <button class="btn small ghost" data-act="history">History</button>
     </div>
   </div>`;
@@ -450,6 +451,7 @@ function releaseHTML(s) {
   } else if (last.state === "failed" && r.available) {
     html += `<div class="notice bad">The last release upgrade failed${last.finished ? ` (${fmtTime(+last.finished)})` : ""}. The log is in History and in /var/log/patchrack-release-upgrade.log on the server. Check the server before trying again.</div>`;
   }
+  if ((s.status === "error" || s.status === "unreachable") && r.available) html += `<div class="muted" style="font-size:13px">From the last check that worked (${ago(r.checked_at)}). Fix the error above and press Check to refresh this.</div>`;
   if (r.unsupported) html += `<div class="notice">${esc(r.unsupported)}</div>`;
   else if (r.available && last.state !== "running") {
     html += `<div class="release-box">
@@ -468,7 +470,7 @@ function dockerStripHTML(s) {
   const st = s.docker_status;
   if (!st || st === "none" || st === "unknown") return "";
   let led, text, list = "";
-  if (st === "no_access") { led = "warn"; text = "<b>Docker installed</b><span>Patchrack has no access yet. Run the setup command again.</span>"; }
+  if (st === "no_access") { led = "warn"; text = "<b>Docker installed</b><span>Patchrack has no access yet. Run this server's setup command again.</span>"; }
   else if (st === "stopped") { led = "bad"; text = "<b>Docker not running</b><span>The Docker service on this server is stopped.</span>"; }
   else if (st === "error" && !s.docker) { led = "bad"; text = "<b>Docker check failed</b><span>Open the server for details.</span>"; }
   else {
@@ -497,7 +499,7 @@ function dockerHTML(s) {
   }
   if (s.docker_status === "no_access") {
     return `<section class="docker" id="docker-${s.id}"><div class="docker-head"><h3>Docker</h3></div>
-      <div class="notice warn">Docker is installed, but Patchrack doesn't have access to it yet. Run the setup command on this server again (Settings, Patchrack SSH key), then press Check.</div></section>`;
+      <div class="notice warn">Docker is installed, but Patchrack doesn't have access to it yet. Choose <b>Setup command</b> below, run it on the server as root, then press Check.</div></section>`;
   }
   if (s.docker_status === "error" && !s.docker) {
     return `<section class="docker" id="docker-${s.id}"><div class="docker-head"><h3>Docker</h3></div>
@@ -594,6 +596,7 @@ async function unitAction(act, s) {
     else if (act === "release") openRelease(s);
     else if (act === "release-follow") { const j = await api("POST", `/api/servers/${s.id}/release-upgrade/follow`); S.jobs.set(j.id, j); openJob(j.id); }
     else if (act === "edit") openEditor(s);
+    else if (act === "setup") openSetup(s);
     else if (act === "history") { location.hash = "#/history"; S.historyFilter = s.id; }
     else if (act === "forget") { await api("POST", `/api/servers/${s.id}/forget-host-key`); toast("Host key cleared. The next connection will trust the new key."); }
   } catch (err) { toast(err.message, "bad"); }
@@ -758,6 +761,28 @@ function openJob(jobId) {
       <div><b>${esc(title)}</b>
       <span>${esc(j.kind === "docker_prune" && ok ? j.summary.replace(/^Freed [\d.]+ [KMGT]?B\.\s*/, "") : j.summary)}</span></div></div>`;
   });
+}
+
+/* ---------- setup command for one server ---------- */
+async function openSetup(s) {
+  let script = "";
+  try { script = (await api("GET", `/api/ssh-key?username=${encodeURIComponent(s.username)}`)).setup_script; }
+  catch (err) { toast(err.message, "bad"); return; }
+  const sheet = openSheet(`
+    <div class="sheet-head"><div><h2>Setup command for ${esc(s.name)}</h2>
+      <p>For the user <span class="mono">${esc(s.username)}</span>, the user Patchrack signs in with on this server.</p></div>
+      <button class="btn ghost small" data-close>Close</button></div>
+    <div class="sheet-body">
+      <ol class="plain-steps">
+        <li>Sign in to ${esc(s.name)} and become root: <span class="mono">sudo -i</span></li>
+        <li>Paste the command below and press Enter. It should end with <span class="mono">Done: ${esc(s.username)} can now be managed by Patchrack</span>.</li>
+        <li>Back here, press <b>Check</b> on the server.</li>
+      </ol>
+      <div class="codebox"><pre>${esc(script)}</pre><button type="button" class="btn small" id="copySetupOne">${ICON.copy}Copy</button></div>
+      <div class="notice">The command only allows apt, dpkg repair, reboot, Docker and the release upgrade helper through sudo for this user. Running it again is safe.</div>
+    </div>
+    <div class="sheet-foot"><button class="btn" data-close>Done</button></div>`);
+  $("#copySetupOne", sheet).onclick = () => copyText(script);
 }
 
 /* ---------- release upgrade ---------- */
@@ -1254,8 +1279,9 @@ async function renderSettings() {
     <section class="card">
       <header><h2>Patchrack SSH key</h2><p>The key Patchrack uses to sign in to your servers. The private half never leaves Patchrack and is stored encrypted.</p></header>
       <div class="field"><span class="label">Public key</span><div class="keyline">${esc(key.public_key)}</div><span class="hint">Fingerprint ${esc(key.fingerprint)}</span></div>
-      <div class="field"><span class="label">Setup command for a new server</span>
-        <div class="codebox"><pre>${esc(key.setup_script)}</pre><button class="btn small" id="copySetup">${ICON.copy}Copy</button></div></div>
+      <div class="field"><label for="setupUser">Setup command for the SSH user</label><input id="setupUser" type="text" value="patchrack" spellcheck="false" style="max-width:260px">
+        <span class="hint">The command sets up only the user named here. A server that signs in with another user needs the command for that user: open the server and choose <b>Setup command</b>.</span></div>
+      <div class="codebox"><pre id="setupPre">${esc(key.setup_script)}</pre><button class="btn small" id="copySetup">${ICON.copy}Copy</button></div>
       <div class="acts"><button class="btn small" id="copyPub">${ICON.copy}Copy public key</button><button class="btn small danger" id="rotate">Replace key</button></div>
     </section>
 
@@ -1295,7 +1321,16 @@ async function renderSettings() {
   }));
   loadNotificationLog();
   $$("[data-clear]").forEach((b) => (b.onclick = async () => { await api("POST", "/api/settings/clear-secret", { key: b.dataset.clear }); toast("Removed"); renderSettings(); }));
-  $("#copySetup").onclick = () => copyText(key.setup_script);
+  $("#copySetup").onclick = () => copyText($("#setupPre").textContent);
+  let setupTimer;
+  $("#setupUser").oninput = (e) => {
+    clearTimeout(setupTimer);
+    setupTimer = setTimeout(async () => {
+      const u = e.target.value.trim() || "patchrack";
+      try { $("#setupPre").textContent = (await api("GET", `/api/ssh-key?username=${encodeURIComponent(u)}`)).setup_script; }
+      catch { $("#setupPre").textContent = "That isn't a valid Linux user name."; }
+    }, 300);
+  };
   $("#copyPub").onclick = () => copyText(key.public_key);
   $("#rotate").onclick = async () => {
     if (!(await confirmBox("Replace the Patchrack key?", "Servers using the current key stop working until you run the new setup command on each one. Only do this if the key may be compromised.", "Replace key", true))) return;

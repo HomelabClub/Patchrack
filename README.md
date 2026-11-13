@@ -20,7 +20,7 @@ Patchrack is a small self-hosted web app that keeps the Linux servers in your ho
 
 ## Project status
 
-Version 0.2.0 adds groups and release upgrades. It's used and tested in a homelab, but it's young. Try it on a server you can afford to experiment with first, and please [open an issue](../../issues) when something doesn't work.
+Version 0.2 adds groups and release upgrades. It's used and tested in a homelab, but it's young. Try it on a server you can afford to experiment with first, and please [open an issue](../../issues) when something doesn't work.
 
 | Area | Tested on |
 |---|---|
@@ -38,7 +38,7 @@ You need Docker with the Compose plugin on the machine that runs Patchrack. It r
 Download the newest `Patchrack_vX.Y.Z.zip` from the [Releases page](../../releases/latest) and unpack it. It contains a `patchrack` folder; this is your Patchrack folder from now on.
 
 ```bash
-unzip Patchrack_v0.2.0.zip
+unzip Patchrack_v0.2.1.zip
 cd patchrack
 ```
 
@@ -84,7 +84,7 @@ To use the ready-made image instead of building it yourself, replace `build: .` 
 ## Add your servers
 
 1. Choose **Add server**, fill in the name and IP address, and keep **Use the Patchrack key** selected.
-2. Copy the **setup command** from that panel. It's also under Settings.
+2. Copy the **setup command** from that panel. It's made for the SSH user you entered. Later you can get it again with the **Setup command** button on the server, or under Settings for any user name.
 3. On the server, become root (`sudo -i`) and paste the command.
 4. Back in Patchrack, choose **Add and test connection**. All three checks should be green.
 
@@ -94,7 +94,7 @@ The setup command:
 - installs `/usr/local/sbin/patchrack-release-upgrade`, the script that runs release upgrades (see [Release upgrades](#release-upgrades))
 - adds `/etc/sudoers.d/patchrack`, which lets that user run only `apt-get`, `dpkg --configure -a`, `systemctl reboot`, the release upgrade script and, when Docker is installed, `docker`, without a password. The file is checked with `visudo` before it's installed.
 
-It doesn't change existing users, passwords, SSH settings or anything else. If you install Docker later, or after updating Patchrack to 0.2.0, run the command again. Running it twice is safe.
+It doesn't change existing users, passwords, SSH settings or anything else. If you install Docker later, or after updating Patchrack to 0.2.0 or newer, run the command again. Running it twice is safe.
 
 To remove Patchrack's access from a server:
 
@@ -173,13 +173,13 @@ Updates don't touch your data. Your account, servers, settings and Patchrack's S
 
 ### Linux: the update script (recommended)
 
-1. Download the new `Patchrack_vX.Y.Z.zip` from the [Releases page](../../releases/latest) to the server. From Windows you can copy it over with `scp Patchrack_v0.2.0.zip you@server:~`.
+1. Download the new `Patchrack_vX.Y.Z.zip` from the [Releases page](../../releases/latest) to the server. From Windows you can copy it over with `scp Patchrack_v0.2.1.zip you@server:~`.
 2. Unpack it into a separate folder, next to your installation:
 
    ```bash
    cd ~
    rm -rf patchrack-update
-   unzip -q Patchrack_v0.2.0.zip -d patchrack-update
+   unzip -q Patchrack_v0.2.1.zip -d patchrack-update
    ```
 
 3. Run the update script from the new release, and give it your Patchrack folder:
@@ -190,10 +190,10 @@ Updates don't touch your data. Your account, servers, settings and Patchrack's S
 
    It shows which version you have and which you'll get, and asks before it changes anything. If Docker needs `sudo` on your server, put `sudo` in front of the command.
 
-4. When it says `Done: Patchrack 0.2.0 is running`, clean up:
+4. When it says `Done: Patchrack 0.2.1 is running`, clean up:
 
    ```bash
-   rm -rf ~/patchrack-update ~/Patchrack_v0.2.0.zip
+   rm -rf ~/patchrack-update ~/Patchrack_v0.2.1.zip
    ```
 
 What the script does:
@@ -233,7 +233,7 @@ In PowerShell, in your Patchrack folder:
 docker run --rm --user 0 -v patchrack_patchrack-data:/data -v "${PWD}\backups:/backup" patchrack:latest tar czf /backup/data-before-update.tgz -C /data .
 
 # 2. Unpack the new release over your installation
-Expand-Archive "$env:USERPROFILE\Downloads\Patchrack_v0.2.0.zip" -DestinationPath "$env:TEMP\patchrack-update" -Force
+Expand-Archive "$env:USERPROFILE\Downloads\Patchrack_v0.2.1.zip" -DestinationPath "$env:TEMP\patchrack-update" -Force
 Copy-Item "$env:TEMP\patchrack-update\patchrack\*" . -Recurse -Force
 
 # 3. Build and start the new version

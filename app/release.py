@@ -110,6 +110,6 @@ def preflight(row, release: dict) -> list[dict]:
          + ("" if free is not None and free >= MIN_FREE_BYTES else " (at least 5 GB needed)")},
         {"ok": bool(helper) and int(helper) >= HELPER_VERSION,
          "text": "Upgrade helper installed" if helper and int(helper) >= HELPER_VERSION
-         else "Upgrade helper missing. Run the setup command on this server again."},
+         else "Upgrade helper missing. Run this server's setup command on the server again."},
     ]
     return checks

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1 (2026-11-13)
+
+Clearer setup commands for servers that sign in with their own user.
+
+- Each server now has a **Setup command** button that gives the command for the user Patchrack signs in with on that server. Before, the Docker notice pointed to the command in Settings, which is always for the user `patchrack`, so servers using another user stayed without sudo and Docker access.
+- Settings has a field for the SSH user, so you can make the setup command for any user.
+- "sudo refused" and "Upgrade helper missing" messages now name the user and point to the server's setup command.
+- When a check fails, the Release upgrade section says it shows the result of the last check that worked.
+
 ## 0.2.0 (2026-11-13)
 
 Groups and release upgrades.

@@ -28,7 +28,7 @@ logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
 log = logging.getLogger("patchrack")
 logging.getLogger("asyncssh").setLevel(logging.WARNING)
 STATIC = Path(__file__).parent / "static"
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 # Where the source code of this build lives. AGPL section 13 asks that people using a
 # (modified) copy over the network can get its source, so the app links to it.
 SOURCE_URL = os.environ.get("PATCHRACK_SOURCE_URL", "").strip()

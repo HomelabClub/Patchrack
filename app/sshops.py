@@ -190,8 +190,9 @@ async def run(conn, t: Target, cmd: str, *, root: bool = False, on_line: LineCb 
     if root and t.become != "root" and code != 0 and ("a password is required" in text
                                                        or "incorrect password" in text
                                                        or "not allowed to execute" in text):
-        raise SSHOpError("sudo refused the command. Run the setup script on this server, or check the "
-                         "sudo settings for this server.")
+        raise SSHOpError(f"sudo refused the command for the user {t.username}. Open the server, choose "
+                         f"Setup command, and run it on the server as root. It must be the command for "
+                         f"{t.username}; the one in Settings is for the user named there.")
     return code, text
 
 
@@ -303,7 +304,7 @@ async def test_sudo(conn, t: Target) -> tuple[bool, str]:
         return True, "sudo can run apt-get"
     if t.become == "sudo_password":
         return False, "sudo rejected the password, or this user may not run apt-get"
-    return False, "sudo cannot run apt-get without a password. Run the setup script on this server."
+    return False, f"sudo cannot run apt-get without a password for {t.username}. Run this server's setup command (for {t.username}) on the server."
 
 
 async def wait_for_reboot(t: Target, old_boot_id: str, timeout_s: int, on_line: LineCb) -> Facts:
