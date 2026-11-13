@@ -10,7 +10,7 @@ import secrets
 import time
 from dataclasses import dataclass, field
 
-from . import db, dockerops, notify
+from . import db, dockerops, notify, release
 from .sshops import Facts, HostKeyChanged, SSHOpError, Target, connect, fingerprint, gather_facts, run, \
     wait_for_reboot, APT_OPTS
 
@@ -53,6 +53,13 @@ def server_public(row) -> dict:
     d["reboot_reason"] = info.get("reboot_reason", "")
     d["docker"] = json.loads(row["docker_json"]) if row["docker_json"] else None
     d.pop("docker_json", None)
+    rel = json.loads(row["release_json"]) if row["release_json"] else None
+    if rel:
+        rel["checks"] = release.preflight(row, rel)
+        rel["ready"] = bool(rel.get("available") and not rel.get("unsupported")
+                            and all(c["ok"] for c in rel["checks"]))
+    d["release"] = rel
+    d.pop("release_json", None)
     d["has_custom_key"] = bool(row["private_key_enc"])
     d["has_passphrase"] = bool(row["passphrase_enc"])
     d["has_sudo_password"] = bool(row["sudo_password_enc"])
@@ -152,7 +159,7 @@ class JobManager:
         self.by_server[sid] = job.id
         self._prune()
         runner = {"check": self._check, "update": self._update, "docker_update": self._docker_update,
-                  "docker_prune": self._docker_prune}[kind]
+                  "docker_prune": self._docker_prune, "release_upgrade": self._release_upgrade}[kind]
         job.task = asyncio.create_task(self._wrap(job, runner))
         bus.publish("job", job.public())
         publish_server(sid)
@@ -197,6 +204,11 @@ class JobManager:
                 await notify.event("update_done", f"{job.server_name} updated", job.summary)
             else:
                 await notify.event("update_failed", f"{job.server_name}: update failed", job.summary, 1)
+        elif job.kind == "release_upgrade":
+            if job.status == "success":
+                await notify.event("update_done", f"{job.server_name}: release upgrade finished", job.summary)
+            else:
+                await notify.event("update_failed", f"{job.server_name}: release upgrade failed", job.summary, 1)
         elif job.kind == "docker_update":
             if job.status == "success":
                 await notify.event("update_done", f"{job.server_name}: containers updated", job.summary)
@@ -248,6 +260,11 @@ class JobManager:
             except SSHOpError as exc:
                 apt_error = exc
             docker = await self._check_docker(job, conn, t)
+            rel = None
+            if not apt_error:
+                await job.set_phase("Looking for a new release")
+                rel = await release.detect(conn, t, facts)
+                self._store_release(t.id, rel)
         finally:
             conn.close()
         if apt_error:
@@ -260,7 +277,152 @@ class JobManager:
         if docker and docker.get("updates"):
             u = docker["updates"]
             job.summary = job.summary.rstrip(".") + f"; {u} container update{'' if u == 1 else 's'}."
+        if rel and rel.get("available"):
+            job.summary = job.summary.rstrip(".") + f"; {rel['target_name']} is available."
         await job.log(job.summary, "result")
+
+    def _store_release(self, sid: int, info: dict) -> None:
+        db.ex("UPDATE servers SET release_json=? WHERE id=?", (json.dumps(info), sid))
+
+    # ---- release upgrade ----
+    async def _release_upgrade(self, job: Job) -> None:
+        opts = job.options
+        row = get_server(job.server_id)
+        t = Target.from_row(row)
+        attach = bool(opts.get("attach"))
+        before = json.loads(row["release_json"]) if row["release_json"] else {}
+        target_name = before.get("target_name") or "the new release"
+        conn = await self._connect(job, t)
+        try:
+            if not attach:
+                await job.set_phase("Checking the requirements again")
+                facts = await gather_facts(conn, t, on_line=job.log)
+                self._store_facts(t.id, facts)
+                info = await release.detect(conn, t, facts)
+                self._store_release(t.id, info)
+                problems = [c["text"] for c in release.preflight(get_server(t.id), info) if not c["ok"]]
+                if info.get("unsupported"):
+                    problems.insert(0, info["unsupported"])
+                elif not info.get("available"):
+                    problems.insert(0, "No new release is available for this server anymore.")
+                if problems:
+                    raise SSHOpError("The upgrade didn't start. " + " ".join(problems))
+                target_name = info["target_name"]
+                await job.set_phase(f"Starting the upgrade to {target_name}")
+                code, out = await run(conn, t, f"{release.HELPER_PATH} start {info['family']} "
+                                               f"{info.get('target') or '-'}", root=True, timeout=60)
+                if code != 0 or "started" not in out:
+                    raise SSHOpError(f"The upgrade helper didn't start the upgrade: {out.strip()[-300:]}")
+        finally:
+            conn.close()
+
+        await job.set_phase(f"Upgrading to {target_name}. This usually takes 30 to 90 minutes; "
+                            "you can close this panel")
+        state, switched_off = await self._follow_upgrade(job, t)
+        if state.get("state") != "success":
+            row = get_server(t.id)
+            if row["release_json"]:   # show the failure in the server's details right away
+                info = json.loads(row["release_json"])
+                info["last"] = state
+                self._store_release(t.id, info)
+                publish_server(t.id)
+            raise SSHOpError(f"The release upgrade failed (exit code {state.get('exit', '?')}). The log shows "
+                             "where. The server may be partly upgraded: check it over SSH before installing "
+                             "other updates.")
+        from_name, to_name = state.get("from", "the old release"), state.get("to", target_name)
+        conn = await self._connect(job, t)
+        try:
+            facts = await gather_facts(conn, t, refresh=False)
+            reboot = opts.get("reboot", True)
+            if reboot:
+                await job.set_phase("Rebooting into the new release")
+                try:
+                    await run(conn, t, "systemctl reboot", root=True, timeout=20)
+                except Exception:
+                    pass
+        finally:
+            conn.close()
+        if reboot:
+            timeout_s = max(int(db.get_setting("reboot_timeout_min") or 10), 15) * 60
+            await job.set_phase(f"Waiting for {t.name} to come back")
+            await wait_for_reboot(t, facts.boot_id, timeout_s, job.log)
+        await job.set_phase("Checking the new release")
+        conn = await self._connect(job, t)
+        try:
+            facts = await gather_facts(conn, t, on_line=job.log)
+            info = await release.detect(conn, t, facts)
+        finally:
+            conn.close()
+        self._store_facts(t.id, facts, updated=True)
+        self._store_release(t.id, info)
+        parts = [f"Upgraded from {from_name} to {to_name}"]
+        parts.append("rebooted" if reboot else "reboot it soon to finish")
+        if facts.packages:
+            parts.append(f"{len(facts.packages)} more update{'' if len(facts.packages) == 1 else 's'} available")
+        job.summary = ", ".join(parts) + "."
+        if switched_off:
+            job.summary += (f" These package sources were switched off during the upgrade: {switched_off}. "
+                            "Turn them back on once they support the new release.")
+        job.result = {"from": from_name, "to": to_name, "rebooted": reboot, "switched_off": switched_off}
+        await job.log(job.summary, "result")
+
+    async def _follow_upgrade(self, job: Job, t: Target) -> tuple[dict, str]:
+        """Stream the helper's log until the upgrade ends. Reconnects when SSH drops."""
+        offset, state, switched_off = 0, {}, ""
+        deadline = time.time() + 4 * 3600
+        conn, started, lost_since = None, time.time(), None
+        cmd = ('L=/var/log/patchrack-release-upgrade.log; S=$(stat -c %s "$L" 2>/dev/null || echo 0); '
+               'if [ "$S" -gt {off} ]; then tail -c +$(({off}+1)) "$L" | head -c $(($S-{off})); echo; fi; '
+               'echo "@@size=$S"; ' + release.HELPER_PATH + ' status | sed "s/^/@@/"')
+        try:
+            while time.time() < deadline:
+                try:
+                    if conn is None:
+                        conn, _ = await connect(t, timeout=15)
+                        if lost_since:
+                            await job.log("Connection restored.", "info")
+                        lost_since = None
+                    code, out = await run(conn, t, cmd.format(off=offset), timeout=120)
+                except HostKeyChanged:
+                    raise
+                except (SSHOpError, OSError, Exception) as exc:  # the connection can drop while sshd upgrades
+                    if conn is not None:
+                        conn.close()
+                    conn = None
+                    if lost_since is None:
+                        lost_since = time.time()
+                        await job.log(f"Lost the connection ({exc.__class__.__name__}); the upgrade continues "
+                                      "on the server. Reconnecting…", "info")
+                    elif time.time() - lost_since > 30 * 60:
+                        raise SSHOpError("Lost contact with the server for 30 minutes during the upgrade. "
+                                         "Check it over SSH or its console.")
+                    await asyncio.sleep(10)
+                    continue
+                meta = {}
+                for line in out.splitlines():
+                    if line.startswith("@@"):
+                        k, _, v = line[2:].partition("=")
+                        meta[k] = v
+                    elif line.strip():
+                        if line.startswith("SWITCHED_OFF_SOURCES="):
+                            switched_off = line.split("=", 1)[1].strip()
+                        await job.log(line, "phase" if line.startswith("== ") else "out")
+                try:
+                    offset = int(meta.get("size", offset))
+                except ValueError:
+                    pass
+                state = {k: v for k, v in meta.items() if k != "size"}
+                if state.get("state") in ("success", "failed"):
+                    return state, switched_off
+                if state.get("stale") == "1" and time.time() - started > 60:
+                    raise SSHOpError("The upgrade process on the server stopped without finishing. "
+                                     "Check /var/log/patchrack-release-upgrade.log on the server.")
+                await asyncio.sleep(5)
+            raise SSHOpError("The upgrade is still running after 4 hours. Patchrack stopped following it; "
+                             "check the server directly.")
+        finally:
+            if conn is not None:
+                conn.close()
 
     async def _check_docker(self, job: Job, conn, t: Target) -> dict | None:
         """Look for Docker and container image updates. Never raises: Docker is optional."""
@@ -444,9 +606,12 @@ manager = JobManager()
 REMINDER_GAP = 20 * 3600
 
 
-async def run_scheduled_checks(trigger: str = "schedule") -> None:
-    rows = db.q("SELECT id, status, pending_count, docker_json FROM servers ORDER BY name")
+async def run_scheduled_checks(trigger: str = "schedule", server_ids: list[int] | None = None) -> None:
+    rows = db.q("SELECT id, status, pending_count, docker_json, release_json FROM servers ORDER BY name")
+    if server_ids is not None:
+        rows = [r for r in rows if r["id"] in server_ids]
     before = {r["id"]: (r["status"], r["pending_count"]) for r in rows}
+    release_before = {r["id"]: _release_target(r["release_json"]) for r in rows}
     containers_before = {r["id"]: _container_updates(r["docker_json"]) for r in rows}
     jobs = []
     for r in rows:
@@ -460,7 +625,7 @@ async def run_scheduled_checks(trigger: str = "schedule") -> None:
     if trigger != "schedule":
         return
     checked = {j.server_id for j in jobs}
-    sys_lines, ct_lines, unreachable = [], [], []
+    sys_lines, ct_lines, unreachable, new_releases = [], [], [], []
     sys_new = ct_new = False
     # list everything that is waiting, on every server, and note whether any of it is new
     for row in db.q("SELECT * FROM servers ORDER BY name COLLATE NOCASE"):
@@ -473,6 +638,9 @@ async def run_scheduled_checks(trigger: str = "schedule") -> None:
                 sys_new = True
         if row["id"] in checked and row["status"] == "unreachable" and prev_status != "unreachable":
             unreachable.append(row["name"])
+        target = _release_target(row["release_json"])
+        if row["id"] in checked and target and target != release_before.get(row["id"]):
+            new_releases.append(f"{row['name']}: {target}")
         now_c = _container_updates(row["docker_json"])
         if now_c:
             ct_lines.append(f"{row['name']}: {', '.join(sorted(now_c))}")
@@ -483,6 +651,15 @@ async def run_scheduled_checks(trigger: str = "schedule") -> None:
                     "Container updates still waiting")
     if unreachable:
         await notify.event("unreachable", "Servers unreachable", ", ".join(unreachable), 1)
+    if new_releases:
+        await notify.event("release_available", "New release available", "\n".join(new_releases))
+
+
+def _release_target(release_json: str | None) -> str | None:
+    if not release_json:
+        return None
+    info = json.loads(release_json)
+    return info.get("target_name") if info.get("available") and not info.get("unsupported") else None
 
 
 async def _announce(kind: str, lines: list[str], is_new: bool, title_new: str, title_waiting: str) -> None:

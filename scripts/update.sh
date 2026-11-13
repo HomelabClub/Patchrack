@@ -67,6 +67,7 @@ start_previous() {
 }
 
 # Called for any unexpected error: undo whatever was already changed
+# shellcheck disable=SC2329  # called by the ERR trap
 on_error() {
   local code=$?
   trap - ERR

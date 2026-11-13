@@ -9,20 +9,23 @@ Patchrack is a small self-hosted web app that keeps the Linux servers in your ho
 - **System updates (apt):** checks every server on a schedule, lists pending packages and highlights security updates.
 - **Your call on reboots:** for each update you choose to not reboot, reboot only if required, or always reboot. Patchrack waits for the server to come back and confirms it's up to date.
 - **Live progress:** the apt and Docker output streams into the browser while it works. Close the panel and the job keeps running.
+- **Groups:** sort your servers into groups, for example by location or by what they run, and check or update a whole group at once.
+- **Release upgrades:** spots when a new Ubuntu or Debian release is available, for example Ubuntu 26.04 LTS or Debian 13, and upgrades the server when you choose to, with safety checks first.
 - **Docker containers:** shows whether Docker is active, how many containers run and which have a newer image. Update them all or pick them by hand, and clean up unused images to free disk space.
-- **Notifications:** Pushover and Prowl, for new updates, finished or failed updates and unreachable servers.
-- **No agents:** servers are reached over SSH with a key. Nothing extra is installed on them.
+- **Notifications:** Pushover and Prowl, for new updates, finished or failed updates, new releases and unreachable servers.
+- **No agents:** servers are reached over SSH with a key. The only thing installed on them is a small, readable script for release upgrades.
 - **Secrets encrypted:** SSH keys, passwords and tokens are encrypted at rest with AES-256-GCM.
 
 ![The Docker section of a server](docs/screenshots/docker.png)
 
 ## Project status
 
-Version 0.1.0 is the first public release. It's used and tested in a homelab, but it's young. Try it on a server you can afford to experiment with first, and please [open an issue](../../issues) when something doesn't work.
+Version 0.2.0 adds groups and release upgrades. It's used and tested in a homelab, but it's young. Try it on a server you can afford to experiment with first, and please [open an issue](../../issues) when something doesn't work.
 
 | Area | Tested on |
 |---|---|
 | Servers | Ubuntu 24.04. Debian 12 uses the same tools but hasn't been tested yet. |
+| Release upgrades | Tested against a simulated upgrader only. Try your first real one on a test VM. |
 | Docker | Docker Engine 29, Docker Compose v2 stacks and plain `docker run` containers |
 | Patchrack host | Linux, and Windows with Docker Desktop |
 
@@ -35,7 +38,7 @@ You need Docker with the Compose plugin on the machine that runs Patchrack. It r
 Download the newest `Patchrack_vX.Y.Z.zip` from the [Releases page](../../releases/latest) and unpack it. It contains a `patchrack` folder; this is your Patchrack folder from now on.
 
 ```bash
-unzip Patchrack_v0.1.2.zip
+unzip Patchrack_v0.2.0.zip
 cd patchrack
 ```
 
@@ -76,7 +79,7 @@ docker compose up -d --build
 
 Open `http://<docker-host>:8080` and create your account.
 
-To use the ready-made image instead of building it yourself, replace `build: .` in `docker-compose.yml` with `image: ghcr.io/HomelabClub/patchrack:latest`. Images are published for `amd64` and `arm64` (Raspberry Pi 4 and 5).
+To use the ready-made image instead of building it yourself, replace `build: .` in `docker-compose.yml` with `image: ghcr.io/homelabclub/patchrack:latest`. Images are published for `amd64` and `arm64` (Raspberry Pi 4 and 5).
 
 ## Add your servers
 
@@ -88,18 +91,27 @@ To use the ready-made image instead of building it yourself, replace `build: .` 
 The setup command:
 
 - creates a `patchrack` user and adds Patchrack's public key to it
-- adds `/etc/sudoers.d/patchrack`, which lets that user run only `apt-get`, `dpkg --configure -a`, `systemctl reboot` and, when Docker is installed, `docker`, without a password. The file is checked with `visudo` before it's installed.
+- installs `/usr/local/sbin/patchrack-release-upgrade`, the script that runs release upgrades (see [Release upgrades](#release-upgrades))
+- adds `/etc/sudoers.d/patchrack`, which lets that user run only `apt-get`, `dpkg --configure -a`, `systemctl reboot`, the release upgrade script and, when Docker is installed, `docker`, without a password. The file is checked with `visudo` before it's installed.
 
-It doesn't change existing users, passwords, SSH settings or anything else. If you install Docker later, run the command again. Running it twice is safe.
+It doesn't change existing users, passwords, SSH settings or anything else. If you install Docker later, or after updating Patchrack to 0.2.0, run the command again. Running it twice is safe.
 
 To remove Patchrack's access from a server:
 
 ```bash
 userdel -r patchrack
-rm /etc/sudoers.d/patchrack
+rm /etc/sudoers.d/patchrack /usr/local/sbin/patchrack-release-upgrade
 ```
 
 If you'd rather use your own user and key, choose **Use my own private key** and pick how sudo works for that user.
+
+## Groups
+
+Choose **Groups…** above the server list to create, rename and delete groups and to move servers between them. You can also pick a group in a server's settings, or create a new one there.
+
+- Each group has its own section with a summary, **Check group** and **Update group…**. Click a group's name to fold it away; Patchrack remembers this in your browser.
+- Servers without a group are listed last, under **No group**. Deleting a group keeps its servers.
+- In **Update…** at the top of the page, tick a group's name to select all its servers.
 
 ## Updating servers
 
@@ -109,6 +121,24 @@ If you'd rather use your own user and key, choose **Use my own private key** and
 - **History** keeps every check and update with its full log.
 
 ![Updating a server](docs/screenshots/update.png)
+
+## Release upgrades
+
+When a check finds a new release, the server shows a blue tag such as *26.04.1 LTS available*. Open the server to see the **Release upgrade** section.
+
+- **Ubuntu:** found with `do-release-upgrade -c`, so the server's own setting in `/etc/update-manager/release-upgrades` decides. LTS servers are offered the next LTS once its first point release is out, for example 24.04 to 26.04.1.
+- **Debian:** Patchrack reads the current stable release from deb.debian.org and offers the next release only, for example 12 (bookworm) to 13 (trixie). Debian supports upgrading one release at a time.
+- **Not offered:** Proxmox VE hosts and Raspberry Pi OS. Use Proxmox's upgrade guide, and a fresh install for Raspberry Pi OS.
+
+Before **Upgrade to…** is available, Patchrack checks that all updates are installed, no reboot is waiting, at least 5 GB is free on `/` and the upgrade script is installed. To start, you confirm that you have a backup or VM snapshot and type the server's name. Then:
+
+- The upgrade runs on the server as a background service, so it continues if Patchrack restarts or the connection drops. Patchrack follows the log live; if you lose it, open the server and choose **Follow its progress**.
+- On Ubuntu, Ubuntu's own upgrader does the work. It switches off package sources from other providers, such as Docker's, during the upgrade. Patchrack lists them afterwards so you can turn them back on once they support the new release.
+- On Debian, Patchrack saves your package sources to `/var/backups/`, switches only Debian's own sources (`debian.org`) to the new release, and runs `apt-get upgrade --without-new-pkgs` and then `apt-get full-upgrade`, as Debian's release notes describe. Sources from other providers are left as they are and listed in the log. If reading the new package lists fails, the old sources are restored and nothing else changes.
+- Configuration files you changed are kept. When it's done, Patchrack reboots the server if you chose that and checks the new release.
+- The full log is in History and on the server in `/var/log/patchrack-release-upgrade.log`.
+
+A release upgrade can't be undone automatically. Make a backup or snapshot first, read the release notes ([Ubuntu](https://discourse.ubuntu.com/c/project/release/38), [Debian](https://www.debian.org/releases/trixie/release-notes/)), and try it on a test server before your important ones. Servers set up before 0.2.0 need the setup command run again to install the upgrade script.
 
 ## Docker containers
 
@@ -135,7 +165,7 @@ Patchrack doesn't change your compose files. Rootless Docker and Podman aren't s
 
 **Prowl:** create an API key at prowlapp.com under API Keys, paste it, turn Prowl on and press **Send test**.
 
-Scheduled checks send one summary message when new updates appear, not one per server. Container updates get their own message, which you can turn off separately.
+Scheduled checks send one summary message when new updates appear, not one per server. Container updates and new releases get their own messages, which you can turn off separately.
 
 ## Updating Patchrack
 
@@ -143,13 +173,13 @@ Updates don't touch your data. Your account, servers, settings and Patchrack's S
 
 ### Linux: the update script (recommended)
 
-1. Download the new `Patchrack_vX.Y.Z.zip` from the [Releases page](../../releases/latest) to the server. From Windows you can copy it over with `scp Patchrack_v0.1.2.zip you@server:~`.
+1. Download the new `Patchrack_vX.Y.Z.zip` from the [Releases page](../../releases/latest) to the server. From Windows you can copy it over with `scp Patchrack_v0.2.0.zip you@server:~`.
 2. Unpack it into a separate folder, next to your installation:
 
    ```bash
    cd ~
    rm -rf patchrack-update
-   unzip -q Patchrack_v0.1.2.zip -d patchrack-update
+   unzip -q Patchrack_v0.2.0.zip -d patchrack-update
    ```
 
 3. Run the update script from the new release, and give it your Patchrack folder:
@@ -160,10 +190,10 @@ Updates don't touch your data. Your account, servers, settings and Patchrack's S
 
    It shows which version you have and which you'll get, and asks before it changes anything. If Docker needs `sudo` on your server, put `sudo` in front of the command.
 
-4. When it says `Done: Patchrack 0.1.2 is running`, clean up:
+4. When it says `Done: Patchrack 0.2.0 is running`, clean up:
 
    ```bash
-   rm -rf ~/patchrack-update ~/Patchrack_v0.1.2.zip
+   rm -rf ~/patchrack-update ~/Patchrack_v0.2.0.zip
    ```
 
 What the script does:
@@ -203,7 +233,7 @@ In PowerShell, in your Patchrack folder:
 docker run --rm --user 0 -v patchrack_patchrack-data:/data -v "${PWD}\backups:/backup" patchrack:latest tar czf /backup/data-before-update.tgz -C /data .
 
 # 2. Unpack the new release over your installation
-Expand-Archive "$env:USERPROFILE\Downloads\Patchrack_v0.1.2.zip" -DestinationPath "$env:TEMP\patchrack-update" -Force
+Expand-Archive "$env:USERPROFILE\Downloads\Patchrack_v0.2.0.zip" -DestinationPath "$env:TEMP\patchrack-update" -Force
 Copy-Item "$env:TEMP\patchrack-update\patchrack\*" . -Recurse -Force
 
 # 3. Build and start the new version

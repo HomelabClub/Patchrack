@@ -29,6 +29,13 @@ if [ -f /var/run/reboot-required ]; then echo REBOOTFILE=1; else echo REBOOTFILE
 echo "REBOOTPKGS=$(tr '\n' ' ' < /var/run/reboot-required.pkgs 2>/dev/null)"
 echo "NEWESTKERNEL=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's#.*/vmlinuz-##' | sort -V | tail -n1)"
 if command -v apt-get >/dev/null 2>&1; then echo APT=1; else echo APT=0; fi
+echo "OSID=${ID:-}"
+echo "VERSIONID=${VERSION_ID:-}"
+if command -v pveversion >/dev/null 2>&1; then echo PVE=1; else echo PVE=0; fi
+if [ -f /etc/rpi-issue ] || grep -qs raspberrypi.com /etc/apt/sources.list.d/*; then echo RPI=1; else echo RPI=0; fi
+echo "ROOTFREE=$(df -Pk / 2>/dev/null | awk 'NR==2{print $4}')"
+echo "HELPER=$(/usr/local/sbin/patchrack-release-upgrade version 2>/dev/null | awk '{print $2}')"
+echo "UPGRADESTATE=$(/usr/local/sbin/patchrack-release-upgrade status 2>/dev/null | tr '\n' ';')"
 """
 
 INST_RE = re.compile(r"^Inst (\S+)(?: \[([^\]]+)\])? \((\S+) (.*?)(?: \[[^\]]+\])?\)")
@@ -86,6 +93,13 @@ class Facts:
     has_apt: bool = True
     packages: list[dict] = field(default_factory=list)
     kept_back: list[str] = field(default_factory=list)
+    os_id: str = ""
+    os_version_id: str = ""
+    is_proxmox: bool = False
+    is_raspberry_pi_os: bool = False
+    root_free: int | None = None
+    helper_version: str = ""
+    upgrade_state: dict = field(default_factory=dict)
 
     @property
     def security_count(self) -> int:
@@ -205,6 +219,17 @@ def _parse_probe(text: str, facts: Facts) -> None:
         reasons.append(f"kernel {newest} installed, running {facts.kernel}")
     facts.reboot_required = bool(reasons)
     facts.reboot_reason = "; ".join(reasons)
+    facts.os_id = kv.get("OSID", "")
+    facts.os_version_id = kv.get("VERSIONID", "")
+    facts.is_proxmox = kv.get("PVE") == "1"
+    facts.is_raspberry_pi_os = kv.get("RPI") == "1"
+    try:
+        facts.root_free = int(kv.get("ROOTFREE") or "") * 1024
+    except ValueError:
+        facts.root_free = None
+    facts.helper_version = kv.get("HELPER", "")
+    state = dict(p.split("=", 1) for p in kv.get("UPGRADESTATE", "").split(";") if "=" in p)
+    facts.upgrade_state = state if state.get("state") not in (None, "none") else {}
 
 
 def _parse_simulation(text: str, facts: Facts) -> None:

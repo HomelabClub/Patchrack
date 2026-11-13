@@ -71,6 +71,11 @@ CREATE TABLE IF NOT EXISTS history (
     finished_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_history_started ON history(started_at DESC);
+CREATE TABLE IF NOT EXISTS server_groups (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    created_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS notifications (
     id INTEGER PRIMARY KEY,
     at REAL NOT NULL,
@@ -92,6 +97,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "notify_update_failed": True,
     "notify_unreachable": True,
     "notify_container_updates": True,
+    "notify_release_available": True,
     "notify_reminder": "daily",          # daily | every | never: repeat messages about waiting updates
     "last_notified_updates_found": 0,
     "last_notified_container_updates": 0,
@@ -128,6 +134,8 @@ MIGRATIONS = {
     "docker_json": "TEXT",
     "docker_updates": "INTEGER NOT NULL DEFAULT 0",
     "docker_error": "TEXT",
+    "group_id": "INTEGER",                     # server_groups.id, NULL = no group
+    "release_json": "TEXT",                    # result of the last release-upgrade check
 }
 
 

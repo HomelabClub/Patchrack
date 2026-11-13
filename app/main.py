@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import crypto, db, notify
+from . import crypto, db, notify, release
 from .jobs import bus, get_server, manager, publish_server, run_scheduled_checks, scheduler_loop, server_public
 from .sshops import SSHOpError, HostKeyChanged, Target, connect, fingerprint, run, test_sudo
 
@@ -28,7 +28,7 @@ logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
 log = logging.getLogger("patchrack")
 logging.getLogger("asyncssh").setLevel(logging.WARNING)
 STATIC = Path(__file__).parent / "static"
-VERSION = "0.1.2"
+VERSION = "0.2.0"
 # Where the source code of this build lives. AGPL section 13 asks that people using a
 # (modified) copy over the network can get its source, so the app links to it.
 SOURCE_URL = os.environ.get("PATCHRACK_SOURCE_URL", "").strip()
@@ -170,9 +170,12 @@ class ServerIn(BaseModel):
     autoremove: bool = True
     reboot_policy: str = Field("if_required", pattern="^(never|if_required|always)$")
     notes: str | None = Field(None, max_length=500)
+    group_id: int | None = None
 
 
 def _validate(body: ServerIn) -> None:
+    if body.group_id is not None and not db.q1("SELECT 1 FROM server_groups WHERE id=?", (body.group_id,)):
+        raise HTTPException(400, "That group doesn't exist anymore")
     if not HOST_RE.match(body.host):
         raise HTTPException(400, "Host must be a hostname or IP address")
     if not USER_RE.match(body.username):
@@ -215,10 +218,10 @@ def create_server(body: ServerIn, user: str = Depends(user_required)):
     if body.become == "sudo_password" and not body.sudo_password:
         raise HTTPException(400, "Enter the sudo password, or choose passwordless sudo")
     sid = db.ex("INSERT INTO servers(name,host,port,username,key_source,become,upgrade_mode,autoremove,"
-                "reboot_policy,notes,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "reboot_policy,notes,group_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (body.name.strip(), body.host.strip(), body.port, body.username, body.key_source,
                  body.become, body.upgrade_mode, int(body.autoremove), body.reboot_policy, body.notes,
-                 time.time()))
+                 body.group_id, time.time()))
     _save_secrets(sid, body)
     publish_server(sid)
     return server_public(get_server(sid))
@@ -236,10 +239,10 @@ def update_server(sid: int, body: ServerIn, user: str = Depends(user_required)):
         raise HTTPException(400, "Enter the sudo password, or choose passwordless sudo")
     host_changed = (body.host.strip(), body.port) != (row["host"], row["port"])
     db.ex("UPDATE servers SET name=?,host=?,port=?,username=?,key_source=?,become=?,upgrade_mode=?,"
-          "autoremove=?,reboot_policy=?,notes=?" + (",host_key=NULL,host_key_fp=NULL" if host_changed else "")
-          + " WHERE id=?",
+          "autoremove=?,reboot_policy=?,notes=?,group_id=?"
+          + (",host_key=NULL,host_key_fp=NULL" if host_changed else "") + " WHERE id=?",
           (body.name.strip(), body.host.strip(), body.port, body.username, body.key_source, body.become,
-           body.upgrade_mode, int(body.autoremove), body.reboot_policy, body.notes, sid))
+           body.upgrade_mode, int(body.autoremove), body.reboot_policy, body.notes, body.group_id, sid))
     _save_secrets(sid, body)
     publish_server(sid)
     return server_public(get_server(sid))
@@ -359,6 +362,126 @@ async def docker_prune(sid: int, body: DockerPrune, user: str = Depends(user_req
     if not any(body.model_dump().values()):
         raise HTTPException(400, "Choose at least one thing to clean up")
     return _start(sid, "docker_prune", body.model_dump())
+
+
+# ---- groups --------------------------------------------------------------------------
+class GroupIn(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+
+
+class ServerGroupIn(BaseModel):
+    group_id: int | None = None
+
+
+def groups_public() -> list[dict]:
+    rows = db.q("SELECT g.id, g.name, COUNT(s.id) AS servers FROM server_groups g "
+                "LEFT JOIN servers s ON s.group_id = g.id GROUP BY g.id ORDER BY g.name COLLATE NOCASE")
+    return [dict(r) for r in rows]
+
+
+def _group_name(body: GroupIn) -> str:
+    name = " ".join(body.name.split())
+    if not name:
+        raise HTTPException(400, "Give the group a name")
+    return name
+
+
+@app.get("/api/groups")
+def list_groups(user: str = Depends(user_required)):
+    return groups_public()
+
+
+@app.post("/api/groups")
+def create_group(body: GroupIn, user: str = Depends(user_required)):
+    name = _group_name(body)
+    if db.q1("SELECT 1 FROM server_groups WHERE name=?", (name,)):
+        raise HTTPException(409, f"A group called {name} already exists")
+    gid = db.ex("INSERT INTO server_groups(name, created_at) VALUES(?,?)", (name, time.time()))
+    bus.publish("groups", {"groups": groups_public()})
+    return {"id": gid, "name": name, "servers": 0}
+
+
+@app.put("/api/groups/{gid}")
+def rename_group(gid: int, body: GroupIn, user: str = Depends(user_required)):
+    name = _group_name(body)
+    if not db.q1("SELECT 1 FROM server_groups WHERE id=?", (gid,)):
+        raise HTTPException(404, "Group not found")
+    if db.q1("SELECT 1 FROM server_groups WHERE name=? AND id<>?", (name, gid)):
+        raise HTTPException(409, f"A group called {name} already exists")
+    db.ex("UPDATE server_groups SET name=? WHERE id=?", (name, gid))
+    bus.publish("groups", {"groups": groups_public()})
+    return {"ok": True}
+
+
+@app.delete("/api/groups/{gid}")
+def delete_group(gid: int, user: str = Depends(user_required)):
+    members = [r["id"] for r in db.q("SELECT id FROM servers WHERE group_id=?", (gid,))]
+    db.ex("UPDATE servers SET group_id=NULL WHERE group_id=?", (gid,))
+    db.ex("DELETE FROM server_groups WHERE id=?", (gid,))
+    bus.publish("groups", {"groups": groups_public()})
+    for sid in members:
+        publish_server(sid)
+    return {"ok": True}
+
+
+@app.put("/api/servers/{sid}/group")
+def set_server_group(sid: int, body: ServerGroupIn, user: str = Depends(user_required)):
+    if not get_server(sid):
+        raise HTTPException(404, "Server not found")
+    if body.group_id is not None and not db.q1("SELECT 1 FROM server_groups WHERE id=?", (body.group_id,)):
+        raise HTTPException(400, "That group doesn't exist anymore")
+    db.ex("UPDATE servers SET group_id=? WHERE id=?", (body.group_id, sid))
+    publish_server(sid)
+    bus.publish("groups", {"groups": groups_public()})
+    return server_public(get_server(sid))
+
+
+@app.post("/api/groups/{gid}/check")
+async def check_group(gid: int, user: str = Depends(user_required)):
+    ids = [r["id"] for r in db.q("SELECT id FROM servers WHERE group_id=?", (gid,))]
+    if ids:
+        asyncio.create_task(run_scheduled_checks("manual", ids))
+    return {"ok": True, "servers": len(ids)}
+
+
+# ---- release upgrades --------------------------------------------------------------------
+class ReleaseUpgradeIn(BaseModel):
+    reboot: bool = True
+    backup_confirmed: bool = False
+    confirm_name: str = ""
+
+
+@app.post("/api/servers/{sid}/release-upgrade")
+async def release_upgrade(sid: int, body: ReleaseUpgradeIn, user: str = Depends(user_required)):
+    row = get_server(sid)
+    if not row:
+        raise HTTPException(404, "Server not found")
+    if body.confirm_name.strip() != row["name"]:
+        raise HTTPException(400, f"Type the server name, {row['name']}, to confirm")
+    if not body.backup_confirmed:
+        raise HTTPException(400, "Confirm that you have a backup or snapshot of this server")
+    rel = json.loads(row["release_json"]) if row["release_json"] else {}
+    if rel.get("unsupported"):
+        raise HTTPException(409, rel["unsupported"])
+    if (rel.get("last") or {}).get("state") == "running":
+        raise HTTPException(409, "A release upgrade is already running on this server")
+    if not rel.get("available"):
+        raise HTTPException(409, "No new release was found for this server. Run a check first.")
+    failed = [c["text"] for c in release.preflight(row, rel) if not c["ok"]]
+    if failed:
+        raise HTTPException(409, failed[0])
+    return _start(sid, "release_upgrade", {"reboot": body.reboot, "target_name": rel.get("target_name")})
+
+
+@app.post("/api/servers/{sid}/release-upgrade/follow")
+async def follow_release_upgrade(sid: int, user: str = Depends(user_required)):
+    row = get_server(sid)
+    if not row:
+        raise HTTPException(404, "Server not found")
+    rel = json.loads(row["release_json"]) if row["release_json"] else {}
+    if (rel.get("last") or {}).get("state") != "running":
+        raise HTTPException(409, "No release upgrade is running on this server. Run a check to refresh.")
+    return _start(sid, "release_upgrade", {"attach": True, "reboot": False})   # no reboot nobody asked for
 
 
 @app.post("/api/check-all")
@@ -483,6 +606,7 @@ class SettingsIn(BaseModel):
     notify_update_done: bool
     notify_update_failed: bool
     notify_unreachable: bool
+    notify_release_available: bool = True
     notify_container_updates: bool = True
     notify_reminder: str = Field("daily", pattern="^(daily|every|never)$")
     pushover_enabled: bool
@@ -494,7 +618,7 @@ class SettingsIn(BaseModel):
 
 
 PLAIN_KEYS = ["schedule_enabled", "check_interval_hours", "max_parallel", "reboot_timeout_min",
-              "notify_updates_found", "notify_update_done", "notify_update_failed", "notify_unreachable", "notify_container_updates",
+              "notify_updates_found", "notify_update_done", "notify_update_failed", "notify_unreachable", "notify_container_updates", "notify_release_available",
               "notify_reminder",
               "pushover_enabled", "prowl_enabled", "app_url"]
 
@@ -582,30 +706,37 @@ def rotate_key(user: str = Depends(user_required)):
 
 
 def setup_script(pub: str, username: str) -> str:
-    return f"""bash -s <<'PATCHRACK'
+    script = """bash -s <<'PATCHRACK'
 set -eu
-U={username}
-KEY='{pub}'
-[ "$(id -u)" -eq 0 ] || {{ echo "Run this as root (sudo -i first)"; exit 1; }}
-command -v sudo >/dev/null || {{ apt-get update -qq && apt-get install -y -qq sudo; }}
+U=@USER@
+KEY='@KEY@'
+[ "$(id -u)" -eq 0 ] || { echo "Run this as root (sudo -i first)"; exit 1; }
+command -v sudo >/dev/null || { apt-get update -qq && apt-get install -y -qq sudo; }
 id "$U" >/dev/null 2>&1 || useradd --create-home --shell /bin/bash "$U"
 H=$(getent passwd "$U" | cut -d: -f6)
 install -d -m 700 -o "$U" -g "$U" "$H/.ssh"
 touch "$H/.ssh/authorized_keys"
 grep -qF "$KEY" "$H/.ssh/authorized_keys" || echo "$KEY" >> "$H/.ssh/authorized_keys"
 chown "$U:$U" "$H/.ssh/authorized_keys"; chmod 600 "$H/.ssh/authorized_keys"
+# Release upgrade helper: the only extra command Patchrack may run as root (see its comments)
+HELPER=/usr/local/sbin/patchrack-release-upgrade
+cat > "$HELPER.new" <<'PRHELPER'
+@HELPER_SOURCE@PRHELPER
+install -m 755 -o root -g root "$HELPER.new" "$HELPER"; rm -f "$HELPER.new"
 APT=$(command -v apt-get); DPKG=$(command -v dpkg); SCTL=$(command -v systemctl)
 DOCKER=$(command -v docker || true)
 T=$(mktemp)
 cat > "$T" <<EOF
-# Managed by Patchrack: lets $U run updates, manage Docker and reboot without a password
+# Managed by Patchrack: lets $U run updates, release upgrades, manage Docker and reboot
 Defaults:$U env_keep += "DEBIAN_FRONTEND NEEDRESTART_MODE APT_LISTCHANGES_FRONTEND LC_ALL"
-$U ALL=(root) NOPASSWD: $APT, $DPKG --configure -a, $SCTL reboot${{DOCKER:+, $DOCKER}}
+$U ALL=(root) NOPASSWD: $APT, $DPKG --configure -a, $SCTL reboot, $HELPER${DOCKER:+, $DOCKER}
 EOF
 visudo -cf "$T" >/dev/null && install -m 440 -o root -g root "$T" /etc/sudoers.d/patchrack
 rm -f "$T"
-echo "Done: $U can now be managed by Patchrack${{DOCKER:+ (including Docker)}}."
+echo "Done: $U can now be managed by Patchrack${DOCKER:+ (including Docker)}."
 PATCHRACK"""
+    helper = release.HELPER_SOURCE if release.HELPER_SOURCE.endswith("\n") else release.HELPER_SOURCE + "\n"
+    return script.replace("@USER@", username).replace("@KEY@", pub).replace("@HELPER_SOURCE@", helper)
 
 
 # ---- frontend ---------------------------------------------------------------------------

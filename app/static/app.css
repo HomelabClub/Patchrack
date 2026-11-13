@@ -389,3 +389,35 @@ details.disclose > div { padding: 0 12px 12px; display: grid; gap: 12px; }
 .nmsg { color: var(--muted); font-size: 13px; margin-top: 2px; overflow-wrap: anywhere; }
 .ndetail { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
 .bad-text { color: var(--red); }
+
+/* ---------- groups ---------- */
+.group { margin-bottom: 18px; }
+.group-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 0 0 8px; }
+.group-toggle { display: flex; align-items: center; gap: 10px; background: none; border: 0; padding: 6px 4px; cursor: pointer; text-align: left; flex-wrap: wrap; }
+.group-toggle h2 { font-size: 17px; }
+.group-toggle .chev { width: 8px; height: 8px; border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted); transform: rotate(45deg); margin: -3px 4px 0 2px; transition: transform .15s; }
+.group-toggle[aria-expanded=false] .chev { transform: rotate(-45deg); margin-top: 0; }
+.group-sum { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+.group-sum .led { width: 8px; height: 8px; }
+.group-acts { display: flex; gap: 6px; }
+.group-empty { border: 1px dashed var(--line); border-radius: var(--r-md); padding: 16px 18px; color: var(--muted); font-size: 13.5px; }
+.gr-new { display: flex; gap: 10px; align-items: flex-end; }
+.gr-list { display: grid; gap: 6px; }
+.gr-row { display: grid; grid-template-columns: 1fr auto auto auto; gap: 8px; align-items: center; }
+.gr-row[data-sid] { grid-template-columns: 1fr 220px; padding: 6px 0; border-bottom: 1px solid var(--line-soft); }
+.gr-row .muted { font-size: 13px; white-space: nowrap; }
+.pick-group { margin-top: 6px; font-size: 14px; }
+.row-group { grid-template-columns: 1fr 200px; }
+@media (prefers-reduced-motion: reduce) { .group-toggle .chev { transition: none; } }
+
+/* ---------- release upgrade ---------- */
+.tag.rel { color: var(--blue); margin: 4px 0 0; display: inline-block; width: fit-content; align-self: flex-start; }
+.unit .os .tag.rel { margin-left: 0; }
+.release { display: grid; gap: 10px; }
+.release-box { display: grid; gap: 12px; padding: 14px 16px; border: 1px solid rgba(90,168,240,.45); border-radius: var(--r-sm); background: rgba(90,168,240,.06); }
+.release-box h3 { font-size: 15px; }
+.release-box p { margin: 2px 0 0; font-size: 13.5px; }
+@media (max-width: 640px) {
+  .gr-row, .gr-row[data-sid], .row-group { grid-template-columns: 1fr; }
+  .gr-new { flex-direction: column; align-items: stretch; }
+}

@@ -128,6 +128,60 @@ def test_docker_actions_need_a_checked_docker_host(client):
     assert r.status_code == 409
 
 
+def test_groups_create_rename_assign_delete(client):
+    g = client.post("/api/groups", json={"name": "  Media   boxes "}, headers=H).json()
+    assert g["name"] == "Media boxes"
+    assert client.post("/api/groups", json={"name": "media BOXES"}, headers=H).status_code == 409
+    other = client.post("/api/groups", json={"name": "Network"}, headers=H).json()
+    assert client.put(f"/api/groups/{other['id']}", json={"name": "Media boxes"}, headers=H).status_code == 409
+    assert client.put(f"/api/groups/{g['id']}", json={"name": "Media"}, headers=H).status_code == 200
+    sid = client.get("/api/servers").json()[0]["id"]
+    assert client.put(f"/api/servers/{sid}/group", json={"group_id": 99999}, headers=H).status_code == 400
+    s = client.put(f"/api/servers/{sid}/group", json={"group_id": g["id"]}, headers=H).json()
+    assert s["group_id"] == g["id"]
+    groups = {x["name"]: x for x in client.get("/api/groups").json()}
+    assert groups["Media"]["servers"] == 1 and groups["Network"]["servers"] == 0
+    # a new server can be created straight into a group; an unknown group is refused
+    body = {"name": "pi", "host": "10.0.0.9", "username": "patchrack", "group_id": other["id"]}
+    assert client.post("/api/servers", json=body, headers=H).json()["group_id"] == other["id"]
+    assert client.post("/api/servers", json={**body, "name": "pi2", "group_id": 4242}, headers=H).status_code == 400
+    assert client.post(f"/api/groups/{g['id']}/check", headers=H).json()["servers"] == 1
+    # deleting a group keeps its servers, without a group
+    assert client.delete(f"/api/groups/{g['id']}", headers=H).status_code == 200
+    assert next(x for x in client.get("/api/servers").json() if x["id"] == sid)["group_id"] is None
+
+
+def test_release_upgrade_needs_confirmation_and_passing_checks(client):
+    import json as _json
+    sid = client.get("/api/servers").json()[0]["id"]
+    name = client.get("/api/servers").json()[0]["name"]
+    url = f"/api/servers/{sid}/release-upgrade"
+    ok = {"reboot": False, "backup_confirmed": True, "confirm_name": name}
+    assert client.post(url, json={**ok, "confirm_name": "wrong"}, headers=H).status_code == 400
+    assert client.post(url, json={**ok, "backup_confirmed": False}, headers=H).status_code == 400
+    assert client.post(url, json=ok, headers=H).status_code == 409          # never checked: nothing available
+    rel = {"family": "ubuntu", "available": True, "target_name": "Ubuntu 26.04.1 LTS", "helper": None,
+           "free_bytes": 2 * 1024 ** 3, "last": None}
+    db.ex("UPDATE servers SET release_json=?, status='ok', pending_count=0, reboot_required=0 WHERE id=?",
+          (_json.dumps(rel), sid))
+    srv = next(x for x in client.get("/api/servers").json() if x["id"] == sid)
+    assert srv["release"]["ready"] is False
+    failed = [c["text"] for c in srv["release"]["checks"] if not c["ok"]]
+    assert any("5 GB" in t for t in failed) and any("helper" in t for t in failed)
+    r = client.post(url, json=ok, headers=H)
+    assert r.status_code == 409 and "GB" in r.json()["detail"]
+    assert client.post(f"{url}/follow", headers=H).status_code == 409    # nothing running
+    rel.update(free_bytes=20 * 1024 ** 3, helper="1", unsupported="This is a Proxmox VE host.")
+    db.ex("UPDATE servers SET release_json=? WHERE id=?", (_json.dumps(rel), sid))
+    assert "Proxmox" in client.post(url, json=ok, headers=H).json()["detail"]
+
+
+def test_setup_script_installs_the_release_helper(client):
+    script = client.get("/api/ssh-key?username=patchrack").json()["setup_script"]
+    assert "/usr/local/sbin/patchrack-release-upgrade" in script and "$SCTL reboot, $HELPER" in script
+    assert "HELPER_VERSION=1" in script and "\nPRHELPER\n" in script
+
+
 def test_failed_logins_are_rate_limited(client):
     client.post("/api/logout", headers=H)
     for _ in range(5):

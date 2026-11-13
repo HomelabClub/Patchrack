@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0 (2026-11-13)
+
+Groups and release upgrades.
+
+- Sort servers into groups. Create, rename and delete groups under **Groups…**, or pick a group in a server's settings. Each group gets its own section with a summary, Check group and Update group…, and can be folded away. The Update… panel lets you select a whole group.
+- Patchrack now spots new Ubuntu and Debian releases, such as Ubuntu 26.04 LTS and Debian 13 (trixie), and can upgrade a server when you choose to. Before starting it checks for pending updates, a waiting reboot, free disk space and the upgrade script, and asks you to confirm a backup and type the server's name. The upgrade runs on the server in the background, survives a Patchrack restart, and can be followed live.
+- New notification when a new release is found, which you can turn off under Settings.
+- The setup command now installs `/usr/local/sbin/patchrack-release-upgrade` and allows it in sudoers. Run the setup command again on servers you added before 0.2.0.
+- Proxmox VE hosts and Raspberry Pi OS aren't offered release upgrades.
+- README: the ready-made image name is now lowercase, `ghcr.io/homelabclub/patchrack`, as GitHub requires.
+
 ## 0.1.2 (2026-11-11)
 
 A safe way to update Patchrack.

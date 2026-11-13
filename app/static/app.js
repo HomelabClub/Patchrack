@@ -10,11 +10,19 @@ const S = {
   settings: null,
   expanded: new Set(),
   dockerSel: new Map(),     // server id -> selected container ids
+  groups: [],               // [{id, name, servers}]
+  collapsed: loadCollapsed(),
   events: null,
   sheetCleanup: null,
 };
 
 /* ---------- helpers ---------- */
+function loadCollapsed() {
+  try { return new Set(JSON.parse(localStorage.getItem("patchrack.collapsed") || "[]")); } catch { return new Set(); }
+}
+function saveCollapsed() {
+  try { localStorage.setItem("patchrack.collapsed", JSON.stringify([...S.collapsed])); } catch { /* private mode */ }
+}
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -54,8 +62,10 @@ function fmtBytes(n) {
   while (Math.abs(n) >= 1000 && i < u.length - 1) { n /= 1000; i++; }
   return i < 2 ? `${Math.round(n)} ${u[i]}` : `${n.toFixed(1)} ${u[i]}`;
 }
-const JOB_VERB = { check: "Checking", update: "Updating", docker_update: "Updating containers on", docker_prune: "Cleaning up Docker on" };
-const JOB_NOUN = { check: "Check", update: "Update", docker_update: "Container update", docker_prune: "Docker clean-up" };
+const JOB_VERB = { check: "Checking", update: "Updating", docker_update: "Updating containers on", docker_prune: "Cleaning up Docker on", release_upgrade: "Upgrading the release of" };
+const JOB_NOUN = { check: "Check", update: "Update", docker_update: "Container update", docker_prune: "Docker clean-up", release_upgrade: "Release upgrade" };
+function shortRelease(name) { return String(name || "").replace(/^(Ubuntu|Debian) /, ""); }
+function groupName(id) { const g = S.groups.find((x) => x.id === id); return g ? g.name : ""; }
 function containerUpdates(s) { return s.docker_status === "ok" && s.docker ? s.docker.updates || 0 : 0; }
 
 function uptime(s) {
@@ -99,7 +109,7 @@ function statusOf(s) {
   const job = s.busy && S.jobs.get(s.busy);
   if (s.busy) {
     const kind = job ? job.kind : "check";
-    const label = { check: "Checking…", update: "Updating…", docker_update: "Updating containers…", docker_prune: "Cleaning up Docker…" }[kind] || "Working…";
+    const label = { check: "Checking…", update: "Updating…", docker_update: "Updating containers…", docker_prune: "Cleaning up Docker…", release_upgrade: "Upgrading release…" }[kind] || "Working…";
     return { led: "busy", cls: "busy", label, sub: job ? job.phase : "" };
   }
   const cu = containerUpdates(s);
@@ -135,8 +145,9 @@ async function boot() {
 }
 
 async function loadData() {
-  const [servers, jobs] = await Promise.all([api("GET", "/api/servers"), api("GET", "/api/jobs")]);
+  const [servers, jobs, groups] = await Promise.all([api("GET", "/api/servers"), api("GET", "/api/jobs"), api("GET", "/api/groups")]);
   S.servers = new Map(servers.map((s) => [s.id, s]));
+  S.groups = groups;
   for (const j of jobs) S.jobs.set(j.id, j);
   connectEvents();
 }
@@ -149,6 +160,11 @@ function connectEvents() {
     const msg = JSON.parse(ev.data);
     if (msg.type === "server") { S.servers.set(msg.data.id, msg.data); refreshRack(msg.data.id); }
     else if (msg.type === "server_deleted") { S.servers.delete(msg.data.id); refreshRack(); }
+    else if (msg.type === "groups") {
+      S.groups = msg.data.groups;
+      if (view() === "servers") renderServers();
+      document.dispatchEvent(new CustomEvent("pd:groups"));
+    }
     else if (msg.type === "job") {
       const prev = S.jobs.get(msg.data.id);
       S.jobs.set(msg.data.id, msg.data);
@@ -248,15 +264,14 @@ function renderServers() {
       <div><h1>Servers</h1><div class="tally" id="tally"></div></div>
       <div class="fleet-actions">
         <button class="btn" data-action="add">${ICON.plus}Add server</button>
+        <button class="btn" data-action="groups">Groups…</button>
         <button class="btn" data-action="check-all">${ICON.refresh}Check all</button>
         <button class="btn primary" data-action="update-all">${ICON.down}Update…</button>
       </div>
     </div>
-    <div class="rack" role="list" id="rack">
-      <div class="rack-head" aria-hidden="true"><span></span><span>Server</span><span>System</span><span>Status</span><span>Checked</span><span></span></div>
-      ${list.map(unitHTML).join("")}
-    </div>`;
+    <div id="rack">${groupSections(list).map(sectionHTML).join("")}</div>`;
   $('[data-action="add"]').onclick = () => openEditor(null);
+  $('[data-action="groups"]').onclick = () => openGroups();
   $('[data-action="check-all"]').onclick = async (e) => {
     e.currentTarget.disabled = true;
     try { await api("POST", "/api/check-all"); toast("Checking all servers"); } catch (err) { toast(err.message, "bad"); }
@@ -265,6 +280,77 @@ function renderServers() {
   $('[data-action="update-all"]').onclick = () => openBulkUpdate();
   bindRack();
   renderTally();
+}
+
+/* ---------- groups in the server list ---------- */
+const RACK_HEAD = `<div class="rack-head" aria-hidden="true"><span></span><span>Server</span><span>System</span><span>Status</span><span>Checked</span><span></span></div>`;
+
+function sectionKey(s) { return S.groups.length ? String(s.group_id ?? "none") : "all"; }
+
+function groupSections(list) {
+  if (!S.groups.length) return [{ key: "all", name: null, servers: list }];
+  const sections = S.groups.map((g) => ({ key: String(g.id), id: g.id, name: g.name, servers: list.filter((s) => s.group_id === g.id) }));
+  const loose = list.filter((s) => !S.groups.some((g) => g.id === s.group_id));
+  if (loose.length) sections.push({ key: "none", id: null, name: "No group", servers: loose });
+  return sections;
+}
+
+function groupSummary(servers) {
+  if (!servers.length) return { led: "", text: "No servers yet" };
+  const n = (f) => servers.filter(f).length;
+  const bad = n((s) => s.status === "unreachable" || s.status === "error");
+  const upd = n((s) => s.status === "updates" || s.status === "reboot" || containerUpdates(s) > 0);
+  const busy = n((s) => s.busy);
+  const parts = [plural(servers.length, "server")];
+  if (upd) parts.push(`${upd} with updates`);
+  if (bad) parts.push(`${bad} unreachable or failing`);
+  if (!upd && !bad) parts.push("all up to date");
+  return { led: busy ? "busy" : bad ? "bad" : upd ? "warn" : "ok", text: parts.join(", ") };
+}
+
+function sectionHTML(sec) {
+  if (sec.name === null) return `<div class="rack" role="list" data-group="all">${RACK_HEAD}${sec.servers.map(unitHTML).join("")}</div>`;
+  const closed = S.collapsed.has(sec.key);
+  const sum = groupSummary(sec.servers);
+  return `<section class="group" data-group="${sec.key}">
+    <div class="group-head">
+      <button class="group-toggle" data-gact="toggle" aria-expanded="${!closed}">
+        <span class="chev" aria-hidden="true"></span><h2>${esc(sec.name)}</h2>
+        <span class="group-sum"><span class="led ${sum.led}"></span><span data-sum>${esc(sum.text)}</span></span></button>
+      ${sec.servers.length ? `<div class="group-acts">
+        <button class="btn small" data-gact="check">${ICON.refresh}Check group</button>
+        <button class="btn small" data-gact="update">${ICON.down}Update group…</button></div>` : ""}
+    </div>
+    ${closed ? "" : sec.servers.length ? `<div class="rack" role="list">${RACK_HEAD}${sec.servers.map(unitHTML).join("")}</div>`
+      : `<div class="group-empty">No servers in this group. Use <b>Groups…</b> or a server's settings to add some.</div>`}
+  </section>`;
+}
+
+function refreshGroupSums() {
+  for (const sec of groupSections(sortedServers())) {
+    const el = $(`[data-group="${sec.key}"] .group-sum`);
+    if (!el) continue;
+    const sum = groupSummary(sec.servers);
+    el.querySelector(".led").className = `led ${sum.led}`;
+    el.querySelector("[data-sum]").textContent = sum.text;
+  }
+}
+
+async function groupAction(act, key) {
+  const servers = groupSections(sortedServers()).find((x) => x.key === key)?.servers || [];
+  if (act === "toggle") {
+    S.collapsed.has(key) ? S.collapsed.delete(key) : S.collapsed.add(key);
+    saveCollapsed(); renderServers();
+    $(`[data-group="${key}"] [data-gact="toggle"]`)?.focus();
+  } else if (act === "check") {
+    try {
+      if (key === "none") for (const s of servers) { if (!s.busy) await api("POST", `/api/servers/${s.id}/check`); }
+      else await api("POST", `/api/groups/${key}/check`);
+      toast(`Checking ${plural(servers.length, "server")}`);
+    } catch (err) { toast(err.message, "bad"); }
+  } else if (act === "update") {
+    openBulkUpdate(servers.map((s) => s.id));
+  }
 }
 
 function renderTally() {
@@ -298,7 +384,7 @@ function unitHTML(s) {
     <div class="unit-main" data-toggle tabindex="0" aria-label="${esc(s.name)}, ${esc(st.label)}">
       <span class="led-cell"><span class="led ${st.led}"></span></span>
       <span class="name"><b>${esc(s.name)}</b><small>${esc(s.username)}@${esc(s.host)}${s.port !== 22 ? ":" + s.port : ""}</small></span>
-      <span class="os"><span>${esc(s.os_name || "—")}</span><small>${s.kernel ? esc(s.kernel) : ""}</small></span>
+      <span class="os"><span>${esc(s.os_name || "—")}</span><small>${s.kernel ? esc(s.kernel) : ""}</small>${releaseTag(s)}</span>
       <span class="state ${st.cls}"><b>${esc(st.label)}</b><span class="sub ${s.status === "updates" && s.security_count && !s.busy ? "sec" : ""}">${esc(st.sub)}</span></span>
       <span class="seen">${ago(s.last_check_at)}</span>
       <span class="acts">
@@ -333,6 +419,7 @@ function detailHTML(s) {
   if (s.kept_back.length) body += `<div class="notice">Held back by apt: <span class="mono">${esc(s.kept_back.join(", "))}</span></div>`;
   if (s.status === "up_to_date" && !s.reboot_required) body += `<div class="notice ok">All packages are current. Last checked ${fmtTime(s.last_check_at)}.</div>`;
   if (s.notes) body += `<div class="muted">${esc(s.notes)}</div>`;
+  body += releaseHTML(s);
   body += dockerHTML(s);
   return `<div class="unit-detail">
     <div class="detail-meta">${meta.join("")}</div>
@@ -342,6 +429,36 @@ function detailHTML(s) {
       <button class="btn small ghost" data-act="history">History</button>
     </div>
   </div>`;
+}
+
+function releaseTag(s) {
+  const r = s.release;
+  if (!r) return "";
+  if ((r.last || {}).state === "running" && !s.busy) return `<span class="tag rel">release upgrade running</span>`;
+  if (!r.available || r.unsupported) return "";
+  return `<span class="tag rel">${esc(shortRelease(r.target_name))} available</span>`;
+}
+
+function releaseHTML(s) {
+  const r = s.release;
+  if (!r) return "";
+  const last = r.last || {};
+  let html = "";
+  if (last.state === "running" && !s.busy) {
+    html += `<div class="notice warn">A release upgrade${r.target_name ? ` to ${esc(r.target_name)}` : ""} is running on this server (started ${ago(+last.started)}).
+      <br><button class="btn small" data-act="release-follow">Follow its progress</button></div>`;
+  } else if (last.state === "failed" && r.available) {
+    html += `<div class="notice bad">The last release upgrade failed${last.finished ? ` (${fmtTime(+last.finished)})` : ""}. The log is in History and in /var/log/patchrack-release-upgrade.log on the server. Check the server before trying again.</div>`;
+  }
+  if (r.unsupported) html += `<div class="notice">${esc(r.unsupported)}</div>`;
+  else if (r.available && last.state !== "running") {
+    html += `<div class="release-box">
+      <div><h3>${esc(r.target_name)} is available</h3><p class="muted">This server runs ${esc(r.current || s.os_name)}. A release upgrade installs the new version of the whole system.</p></div>
+      <ul class="steps">${(r.checks || []).map((c) => `<li><span class="led ${c.ok ? "ok" : "bad"}"></span><span>${esc(c.text)}</span></li>`).join("")}</ul>
+      <div><button class="btn small ${r.ready ? "primary" : ""}" data-act="release" ${r.ready && !s.busy ? "" : "disabled"}>Upgrade to ${esc(r.target_name)}…</button></div>
+    </div>`;
+  } else if (r.note) html += `<div class="muted" style="font-size:13px">${esc(r.note)}</div>`;
+  return html ? `<section class="release" id="release-${s.id}">${html}</section>` : "";
 }
 
 const CHECK_TEXT = { excluded: "Excluded", pinned: "Pinned version", local: "Built locally", unknown: "Can't check", self: "Patchrack itself" };
@@ -429,6 +546,8 @@ function bindRack() {
   if (!rack || rack.dataset.bound) return;
   rack.dataset.bound = "1";
   rack.addEventListener("click", (e) => {
+    const gbtn = e.target.closest("[data-gact]");
+    if (gbtn) { groupAction(gbtn.dataset.gact, gbtn.closest("[data-group]").dataset.group); return; }
     const unit = e.target.closest(".unit");
     if (!unit) return;
     const id = +unit.dataset.id, s = S.servers.get(id);
@@ -472,6 +591,8 @@ async function unitAction(act, s) {
     else if (act === "dk-update-sel") openDockerUpdate(s, [...(S.dockerSel.get(s.id) || [])]);
     else if (act === "dk-update-all") openDockerUpdate(s, s.docker.containers.filter((c) => c.check === "update").map((c) => c.id));
     else if (act === "dk-prune") openDockerPrune(s);
+    else if (act === "release") openRelease(s);
+    else if (act === "release-follow") { const j = await api("POST", `/api/servers/${s.id}/release-upgrade/follow`); S.jobs.set(j.id, j); openJob(j.id); }
     else if (act === "edit") openEditor(s);
     else if (act === "history") { location.hash = "#/history"; S.historyFilter = s.id; }
     else if (act === "forget") { await api("POST", `/api/servers/${s.id}/forget-host-key`); toast("Host key cleared. The next connection will trust the new key."); }
@@ -481,16 +602,22 @@ async function unitAction(act, s) {
 function refreshRack(id) {
   if (view() !== "servers" || !S.session?.user) return;
   const rack = $("#rack");
-  if (!rack || (id === undefined)) { renderServers(); return; }
+  if (!rack || id === undefined) { renderServers(); return; }
   const s = S.servers.get(id);
   const old = rack.querySelector(`.unit[data-id="${id}"]`);
-  if (!s || !old) { renderServers(); return; }
+  const section = old?.closest("[data-group]");
+  if (!s || !old || !section || section.dataset.group !== sectionKey(s)) {
+    // new server, deleted server or moved to another group: draw the list again
+    if (!s || !(S.collapsed.has(sectionKey(s)))) renderServers(); else { renderTally(); refreshGroupSums(); }
+    return;
+  }
   const focusedAct = document.activeElement?.closest?.(`.unit[data-id="${id}"]`) ? document.activeElement.dataset.act : null;
   const tmp = document.createElement("div");
   tmp.innerHTML = unitHTML(s);
   old.replaceWith(tmp.firstElementChild);
   if (focusedAct) rack.querySelector(`.unit[data-id="${id}"] [data-act="${focusedAct}"]`)?.focus();
   renderTally();
+  refreshGroupSums();
 }
 setInterval(() => { if (view() === "servers" && !$(".sheet")) $$(".unit").forEach((u) => { const s = S.servers.get(+u.dataset.id); const el = u.querySelector(".seen"); if (s && el) el.textContent = ago(s.last_check_at); }); }, 30000);
 
@@ -621,6 +748,8 @@ function openJob(jobId) {
     } else if (j.kind === "docker_update") {
       good = ok && !r.remaining;
       title = ok ? (good ? "All containers are up to date" : "Containers updated") : (r.updated && r.updated.length ? "Some containers failed to update" : "Container update failed");
+    } else if (j.kind === "release_upgrade") {
+      good = ok; title = ok ? "Release upgrade finished" : "Release upgrade failed";
     } else if (j.kind === "docker_prune") {
       good = ok; title = ok ? `Freed ${fmtBytes(r.freed)}` : "Clean-up failed";
     } else { good = ok; title = ok ? "Check finished" : "Check failed"; }
@@ -629,6 +758,88 @@ function openJob(jobId) {
       <div><b>${esc(title)}</b>
       <span>${esc(j.kind === "docker_prune" && ok ? j.summary.replace(/^Freed [\d.]+ [KMGT]?B\.\s*/, "") : j.summary)}</span></div></div>`;
   });
+}
+
+/* ---------- release upgrade ---------- */
+function openRelease(s) {
+  const r = s.release || {};
+  const debian = r.family === "debian";
+  const sheet = openSheet(`
+    <div class="sheet-head"><span class="led warn"></span><div><h2>Upgrade ${esc(s.name)} to ${esc(r.target_name)}</h2>
+      <p>${esc(r.current || s.os_name)} becomes ${esc(r.target_name)}.</p></div>
+      <button class="btn ghost small" data-close>Close</button></div>
+    <div class="sheet-body">
+      <div class="notice">Patchrack installs the new release on the server. This usually takes 30 to 90 minutes, and services on the server may stop for a while. The upgrade keeps running on the server even if you close this panel or Patchrack restarts.</div>
+      <div class="notice">${debian
+        ? `Patchrack switches Debian's own package sources to ${esc(r.target)} and follows Debian's upgrade steps. Package sources from other providers are left as they are: check that they support ${esc(r.target)}. <a href="https://www.debian.org/releases/${encodeURIComponent(r.target)}/release-notes/" target="_blank" rel="noopener">Read Debian's release notes</a> first.`
+        : `Ubuntu's own upgrader does the work. It switches off package sources from other providers, such as Docker's, during the upgrade. Patchrack lists them afterwards, so you can turn them back on once they support the new release.`}</div>
+      <div><div class="section-title">Checks</div><ul class="steps">${(r.checks || []).map((c) => `<li><span class="led ${c.ok ? "ok" : "bad"}"></span><span>${esc(c.text)}</span></li>`).join("")}</ul></div>
+      <div class="notice warn">A release upgrade can't be undone automatically. Make a backup or VM snapshot first, and try it on a test server before your important ones.</div>
+      <label class="check"><input type="checkbox" id="rlBackup"> I have a backup or snapshot of ${esc(s.name)}</label>
+      <label class="check"><input type="checkbox" id="rlReboot" checked> Reboot when the upgrade is done (recommended)</label>
+      <div class="field"><label for="rlName">Type <b>${esc(s.name)}</b> to confirm</label><input id="rlName" type="text" autocomplete="off" spellcheck="false"></div>
+    </div>
+    <div class="sheet-foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="rlGo" disabled>Start release upgrade</button></div>`);
+  const sync = () => { $("#rlGo", sheet).disabled = !($("#rlBackup", sheet).checked && $("#rlName", sheet).value.trim() === s.name && r.ready); };
+  sheet.addEventListener("input", sync); sheet.addEventListener("change", sync);
+  $("#rlGo", sheet).onclick = async () => {
+    try {
+      const j = await api("POST", `/api/servers/${s.id}/release-upgrade`, { reboot: $("#rlReboot", sheet).checked, backup_confirmed: true, confirm_name: $("#rlName", sheet).value.trim() });
+      S.jobs.set(j.id, j); openJob(j.id);
+    } catch (err) { toast(err.message, "bad"); }
+  };
+}
+
+/* ---------- groups management ---------- */
+function openGroups() {
+  const sheet = openSheet(`
+    <div class="sheet-head"><div><h2>Groups</h2><p>Sort your servers into groups, for example by location or by what they run. Each server can be in one group.</p></div>
+      <button class="btn ghost small" data-close>Close</button></div>
+    <div class="sheet-body" id="grBody"></div>
+    <div class="sheet-foot"><button class="btn" data-close>Done</button></div>`, { onClose: () => document.removeEventListener("pd:groups", draw) });
+  const body = $("#grBody", sheet);
+  function draw() {
+    const opts = (sel) => `<option value="">No group</option>${S.groups.map((g) => `<option value="${g.id}" ${sel === g.id ? "selected" : ""}>${esc(g.name)}</option>`).join("")}`;
+    body.innerHTML = `
+      <form class="gr-new" id="grNew"><div class="field" style="flex:1"><label for="grName">New group</label><input id="grName" type="text" maxlength="40" placeholder="Media, Network, Lab…"></div>
+        <button class="btn" type="submit">${ICON.plus}Add group</button></form>
+      ${S.groups.length ? `<div><div class="section-title">Your groups</div><div class="gr-list">${S.groups.map((g) => `
+        <div class="gr-row" data-gid="${g.id}"><input type="text" value="${esc(g.name)}" maxlength="40" aria-label="Name of group ${esc(g.name)}">
+          <span class="muted">${plural(g.servers, "server")}</span>
+          <button class="btn small" data-gr="rename">Rename</button><button class="btn small danger" data-gr="delete">Delete</button></div>`).join("")}</div></div>` : ""}
+      <div><div class="section-title">Servers</div>${S.servers.size ? `<div class="gr-list">${sortedServers().map((s) => `
+        <div class="gr-row" data-sid="${s.id}"><b>${esc(s.name)}</b><select aria-label="Group for ${esc(s.name)}">${opts(s.group_id)}</select></div>`).join("")}</div>`
+        : `<p class="muted">Add servers first.</p>`}</div>`;
+    $("#grNew", body).onsubmit = async (e) => {
+      e.preventDefault();
+      const name = $("#grName", body).value.trim();
+      if (!name) return;
+      try { await api("POST", "/api/groups", { name }); S.groups = await api("GET", "/api/groups"); draw(); toast(`Group ${name} added`); $("#grName", body)?.focus(); }
+      catch (err) { toast(err.message, "bad"); }
+    };
+    $$("[data-gr]", body).forEach((b) => (b.onclick = async () => {
+      const row = b.closest("[data-gid]"), gid = +row.dataset.gid, g = S.groups.find((x) => x.id === gid);
+      try {
+        if (b.dataset.gr === "rename") {
+          const name = row.querySelector("input").value.trim();
+          if (!name || name === g.name) return;
+          await api("PUT", `/api/groups/${gid}`, { name }); toast(`Renamed to ${name}`);
+        } else {
+          if (!(await confirmBox(`Delete the group ${g.name}?`, g.servers ? `Its ${plural(g.servers, "server")} stay in Patchrack, without a group.` : "The group is empty.", "Delete group", true))) return;
+          await api("DELETE", `/api/groups/${gid}`); toast(`Group ${g.name} deleted`);
+        }
+        S.groups = await api("GET", "/api/groups"); draw();
+      } catch (err) { toast(err.message, "bad"); }
+    }));
+    $$("[data-gid] input", body).forEach((inp) => (inp.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); inp.closest("[data-gid]").querySelector('[data-gr="rename"]').click(); } }));
+    $$("[data-sid] select", body).forEach((sel) => (sel.onchange = async () => {
+      const sid = +sel.closest("[data-sid]").dataset.sid;
+      try { const saved = await api("PUT", `/api/servers/${sid}/group`, { group_id: sel.value ? +sel.value : null }); S.servers.set(sid, saved); }
+      catch (err) { toast(err.message, "bad"); }
+    }));
+  }
+  document.addEventListener("pd:groups", draw);
+  draw();
 }
 
 /* ---------- docker: update & clean up ---------- */
@@ -687,21 +898,23 @@ function openDockerPrune(s) {
 }
 
 /* ---------- bulk update ---------- */
-function openBulkUpdate() {
+function openBulkUpdate(onlyIds = null) {
   const list = sortedServers();
-  const eligible = list.filter((s) => !s.busy && (s.status === "updates" || s.status === "reboot"));
+  const eligible = list.filter((s) => !s.busy && (s.status === "updates" || s.status === "reboot") && (!onlyIds || onlyIds.includes(s.id)));
   const anyReboot = eligible.some((s) => s.reboot_required);
   const sheet = openSheet(`
     <div class="sheet-head"><span class="led warn"></span><div><h2>Update servers</h2>
       <p>Choose which servers to update. Up to ${S.settings?.max_parallel ?? 3} run at the same time.</p></div><button class="btn ghost small" data-close>Close</button></div>
     <div class="sheet-body">
       <div><div class="section-title">Servers</div><div class="seg" id="pick">
-        ${list.length ? list.map((s) => {
-          const st = statusOf(s);
-          const sel = eligible.includes(s);
-          return `<label class="choice"><input type="checkbox" value="${s.id}" ${sel ? "checked" : ""} ${s.busy ? "disabled" : ""}>
-            <span><b>${esc(s.name)}</b><span>${esc(st.label)}${st.sub ? ", " + esc(st.sub) : ""}</span></span></label>`;
-        }).join("") : '<p class="muted">No servers yet.</p>'}
+        ${list.length ? groupSections(list).filter((g) => g.servers.length).map((g) => `
+          ${g.name !== null ? `<label class="check pick-group"><input type="checkbox" data-pg="${g.key}"> <b>${esc(g.name)}</b></label>` : ""}
+          ${g.servers.map((s) => {
+            const st = statusOf(s);
+            const sel = eligible.includes(s);
+            return `<label class="choice"><input type="checkbox" value="${s.id}" data-in="${g.key}" ${sel ? "checked" : ""} ${s.busy ? "disabled" : ""}>
+              <span><b>${esc(s.name)}</b><span>${esc(st.label)}${st.sub ? ", " + esc(st.sub) : ""}</span></span></label>`;
+          }).join("")}`).join("") : '<p class="muted">No servers yet.</p>'}
       </div></div>
       <div><div class="section-title">Reboot</div>${rebootChoices("breboot", "if_required", anyReboot, anyReboot ? "on at least one selected server" : "")}</div>
       <label class="check"><input type="checkbox" id="bauto" checked> Remove packages that are no longer needed (autoremove)</label>
@@ -709,9 +922,18 @@ function openBulkUpdate() {
     </div>
     <div class="sheet-foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="bgo">Update selected</button></div>`,
   { onClose: () => document.removeEventListener("pd:job", onJob) });
-  const ids = () => $$("#pick input:checked", sheet).map((i) => +i.value);
-  const sync = () => { const n = ids().length; $("#bgo", sheet).disabled = !n; $("#bgo", sheet).textContent = n ? `Update ${plural(n, "server")}` : "Select servers"; };
-  $("#pick", sheet).addEventListener("change", sync); sync();
+  const ids = () => $$("#pick input[value]:checked", sheet).map((i) => +i.value);
+  const syncGroups = () => $$("[data-pg]", sheet).forEach((g) => {
+    const boxes = $$(`[data-in="${g.dataset.pg}"]:not(:disabled)`, sheet);
+    g.checked = boxes.length > 0 && boxes.every((b) => b.checked);
+    g.indeterminate = !g.checked && boxes.some((b) => b.checked);
+  });
+  const sync = () => { const n = ids().length; $("#bgo", sheet).disabled = !n; $("#bgo", sheet).textContent = n ? `Update ${plural(n, "server")}` : "Select servers"; syncGroups(); };
+  $("#pick", sheet).addEventListener("change", (e) => {
+    if (e.target.dataset.pg) $$(`[data-in="${e.target.dataset.pg}"]:not(:disabled)`, sheet).forEach((b) => (b.checked = e.target.checked));
+    sync();
+  });
+  sync();
   let started = [];
   const onJob = () => paint();
   const paint = () => {
@@ -748,7 +970,13 @@ async function openEditor(s) {
     <div class="sheet-head"><div><h2>${isNew ? "Add server" : `${esc(s.name)} settings`}</h2>
       <p>${isNew ? "Patchrack signs in with an SSH key. Passwords are never used to log in." : "Leave secret fields empty to keep what's stored."}</p></div><button class="btn ghost small" data-close>Close</button></div>
     <form class="sheet-body" id="ed" autocomplete="off">
-      <div class="field"><label for="f-name">Name</label><input id="f-name" type="text" value="${esc(s.name)}" placeholder="pve-node-01" required autofocus></div>
+      <div class="row2 row-group">
+        <div class="field"><label for="f-name">Name</label><input id="f-name" type="text" value="${esc(s.name)}" placeholder="pve-node-01" required autofocus></div>
+        <div class="field"><label for="f-group">Group</label><select id="f-group">
+          <option value="">No group</option>${S.groups.map((g) => `<option value="${g.id}" ${s.group_id === g.id ? "selected" : ""}>${esc(g.name)}</option>`).join("")}
+          <option value="new">New group…</option></select></div>
+      </div>
+      <div class="field hidden" id="f-newgroup-box"><label for="f-newgroup">Name of the new group</label><input id="f-newgroup" type="text" maxlength="40" placeholder="Media, Network, Lab…"></div>
       <div class="row2">
         <div class="field"><label for="f-host">Hostname or IP address</label><input id="f-host" type="text" value="${esc(s.host)}" placeholder="192.168.1.20" required></div>
         <div class="field"><label for="f-port">SSH port</label><input id="f-port" type="number" min="1" max="65535" value="${s.port}"></div>
@@ -762,7 +990,7 @@ async function openEditor(s) {
       </div></div>
 
       <div id="appKeyBox" class="subcard">
-        <div><h3>Setup command</h3><p class="muted" style="margin:4px 0 0;font-size:13.5px">Run this once on the server as root. It creates the <span class="mono">${esc(s.username || "patchrack")}</span> user, installs the Patchrack public key, and allows only apt, dpkg repair and reboot through sudo.</p></div>
+        <div><h3>Setup command</h3><p class="muted" style="margin:4px 0 0;font-size:13.5px">Run this once on the server as root. It creates the <span class="mono">${esc(s.username || "patchrack")}</span> user, installs the Patchrack public key, and allows only apt, dpkg repair, reboot, Docker and the release upgrade helper through sudo. Already set up? Run it again after updating Patchrack to install the newest helper.</p></div>
         <div class="codebox"><pre id="script">${esc(keyInfo?.setup_script || "Could not load the key")}</pre><button type="button" class="btn small" id="copyScript">${ICON.copy}Copy</button></div>
       </div>
 
@@ -815,6 +1043,10 @@ async function openEditor(s) {
     $("#sudoBox", sheet).classList.toggle("hidden", bc !== "sudo_password");
   };
   sheet.addEventListener("change", syncBoxes); syncBoxes();
+  $("#f-group", sheet).addEventListener("change", (e) => {
+    $("#f-newgroup-box", sheet).classList.toggle("hidden", e.target.value !== "new");
+    if (e.target.value === "new") $("#f-newgroup", sheet).focus();
+  });
   $("#copyScript", sheet).onclick = () => copyText($("#script", sheet).textContent);
   let userTimer;
   $("#f-user", sheet).addEventListener("input", () => {
@@ -838,6 +1070,13 @@ async function openEditor(s) {
   // once a new server is saved, retries update it instead of creating a duplicate
   let savedId = isNew ? null : s.id;
   const save = async () => {
+    let groupId = $("#f-group", sheet).value;
+    if (groupId === "new") {
+      const name = $("#f-newgroup", sheet).value.trim();
+      if (!name) { $("#edErr", sheet).textContent = "Give the new group a name, or choose another group."; return; }
+      try { groupId = (await api("POST", "/api/groups", { name })).id; S.groups = await api("GET", "/api/groups"); }
+      catch (err) { $("#edErr", sheet).textContent = err.message; return; }
+    }
     const body = {
       name: $("#f-name", sheet).value.trim(), host: $("#f-host", sheet).value.trim(), port: +$("#f-port", sheet).value || 22,
       username: $("#f-user", sheet).value.trim(), key_source: $('input[name="ks"]:checked', sheet).value,
@@ -845,6 +1084,7 @@ async function openEditor(s) {
       become: $('input[name="bc"]:checked', sheet).value, sudo_password: $("#f-sudo", sheet).value || null,
       upgrade_mode: $("#f-mode", sheet).value, reboot_policy: $("#f-reboot", sheet).value,
       autoremove: $("#f-auto", sheet).checked, notes: $("#f-notes", sheet).value.trim() || null,
+      group_id: groupId ? +groupId : null,
     };
     const btn = $("#save", sheet);
     $("#edErr", sheet).textContent = "";
@@ -879,7 +1119,7 @@ async function renderHistory() {
   main.innerHTML = `<div class="page-head"><div><h1>History</h1><p>Every check and update, newest first.</p></div>
     <div class="fleet-actions"><select id="hf" aria-label="Filter by server" style="width:200px"><option value="">All servers</option>
       ${sortedServers().map((s) => `<option value="${s.id}" ${S.historyFilter === s.id ? "selected" : ""}>${esc(s.name)}</option>`).join("")}</select>
-      <select id="hk" aria-label="Filter by kind" style="width:150px"><option value="">Everything</option><option value="update">System updates</option><option value="docker_update">Container updates</option><option value="docker_prune">Docker clean-ups</option><option value="check">Checks</option></select></div></div>
+      <select id="hk" aria-label="Filter by kind" style="width:150px"><option value="">Everything</option><option value="update">System updates</option><option value="docker_update">Container updates</option><option value="docker_prune">Docker clean-ups</option><option value="release_upgrade">Release upgrades</option><option value="check">Checks</option></select></div></div>
     <div class="list" id="hl"><div class="empty"><p>Loading…</p></div></div>`;
   const load = async () => {
     const sid = $("#hf").value;
@@ -985,6 +1225,7 @@ async function renderSettings() {
         ${sw("n-done", st.notify_update_done, "Update finished", "")}
         ${sw("n-fail", st.notify_update_failed, "Update failed", "Sent with high priority.")}
         ${sw("n-cont", st.notify_container_updates, "Container updates available", "From scheduled checks, when containers have newer images.")}
+        ${sw("n-rel", st.notify_release_available, "New release available", "When a scheduled check finds a new Ubuntu or Debian release.")}
         ${sw("n-unr", st.notify_unreachable, "Server unreachable", "When a scheduled check can't connect.")}
       </div>
       <div class="field" style="max-width:calc(50% - 6px)"><label for="n-rem">Remind me about waiting updates</label><select id="n-rem">
@@ -1032,7 +1273,7 @@ async function renderSettings() {
     schedule_enabled: $("#s-sched").checked, check_interval_hours: +$("#s-int").value, max_parallel: +$("#s-par").value || 3,
     reboot_timeout_min: +$("#s-rto").value || 10,
     notify_updates_found: $("#n-found").checked, notify_update_done: $("#n-done").checked,
-    notify_update_failed: $("#n-fail").checked, notify_unreachable: $("#n-unr").checked, notify_container_updates: $("#n-cont").checked,
+    notify_update_failed: $("#n-fail").checked, notify_unreachable: $("#n-unr").checked, notify_release_available: $("#n-rel").checked, notify_container_updates: $("#n-cont").checked,
     notify_reminder: $("#n-rem").value,
     pushover_enabled: $("#po-on").checked, pushover_token: $("#po-token").value.trim() || null, pushover_user: $("#po-user").value.trim() || null,
     prowl_enabled: $("#pr-on").checked, prowl_apikey: $("#pr-key").value.trim() || null, app_url: $("#s-url").value.trim(),
