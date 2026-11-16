@@ -186,7 +186,9 @@ def test_setup_script_installs_the_release_helper(client):
 
 def test_automatic_updates_api(client):
     import json as _json
-    srv = client.get("/api/servers").json()[0]
+    # a server of its own: other tests start background checks that may still be running
+    srv = client.post("/api/servers", json={"name": "autotest", "host": "192.0.2.10", "username": "patchrack"},
+                      headers=H).json()
     sid = srv["id"]
     assert srv["auto"]["enabled"] is False and srv["auto"]["config"] is None
     url = f"/api/servers/{sid}/auto"
@@ -204,7 +206,7 @@ def test_automatic_updates_api(client):
                               "updating some containers failed; rebooted the server.")
     r = client.delete(f"/api/servers/{sid}", headers=H)
     assert r.status_code == 409 and "Turn them off first" in r.json()["detail"]
-    db.ex("UPDATE servers SET auto_enabled=0 WHERE id=?", (sid,))
+    assert client.delete(f"/api/servers/{sid}?force=true", headers=H).status_code == 200
 
 
 def test_setup_script_installs_the_auto_update_script(client):
