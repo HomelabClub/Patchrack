@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0 (2026-11-16)
+
+Automatic updates.
+
+- Each server has an **Auto-update** switch. When it's on, the server installs its updates itself from a cron job at the time and on the days you choose, and reboots by itself when an update needs it. Turning it off removes the cron job and its settings from the server.
+- Optionally, after a successful system update, the server also updates its Docker Compose containers: it pulls new images for the running services and recreates only the services that got a new image (and containers that share their network). Unapplied edits to Compose files stay unapplied.
+- For servers with automatic updates on, Patchrack's scheduled checks (and Check all, Check group) only read the result of the last run, show it in the server's details with its log, and notify you of runs that changed something or failed. Check on the server still does a full check.
+- Release upgrades are never automatic; a run is skipped while a release upgrade is running.
+- The setup command installs `/usr/local/sbin/patchrack-auto-update` and allows it in sudoers. Run each server's setup command again (open the server, **Setup command**).
+- The setup command now stops with a message if the sudo rules don't pass `visudo`'s check, instead of finishing as if all went well.
+- The schedule uses the server's system time zone, the one cron uses, and Patchrack shows it, even when a login session sets another `TZ`.
+- A server with automatic updates on asks for confirmation before it's deleted, because the cron job then stays on the server.
+
 ## 0.2.1 (2026-11-13)
 
 Clearer setup commands for servers that sign in with their own user.

@@ -146,9 +146,11 @@ def test_groups_create_rename_assign_delete(client):
     assert client.post("/api/servers", json=body, headers=H).json()["group_id"] == other["id"]
     assert client.post("/api/servers", json={**body, "name": "pi2", "group_id": 4242}, headers=H).status_code == 400
     assert client.post(f"/api/groups/{g['id']}/check", headers=H).json()["servers"] == 1
+    assert client.post("/api/groups/0/check", headers=H).json()["servers"] == 0      # every server has a group
     # deleting a group keeps its servers, without a group
     assert client.delete(f"/api/groups/{g['id']}", headers=H).status_code == 200
     assert next(x for x in client.get("/api/servers").json() if x["id"] == sid)["group_id"] is None
+    assert client.post("/api/groups/0/check", headers=H).json()["servers"] == 1      # now without a group
 
 
 def test_release_upgrade_needs_confirmation_and_passing_checks(client):
@@ -180,6 +182,36 @@ def test_setup_script_installs_the_release_helper(client):
     script = client.get("/api/ssh-key?username=patchrack").json()["setup_script"]
     assert "/usr/local/sbin/patchrack-release-upgrade" in script and "$SCTL reboot, $HELPER" in script
     assert "HELPER_VERSION=1" in script and "\nPRHELPER\n" in script
+
+
+def test_automatic_updates_api(client):
+    import json as _json
+    srv = client.get("/api/servers").json()[0]
+    sid = srv["id"]
+    assert srv["auto"]["enabled"] is False and srv["auto"]["config"] is None
+    url = f"/api/servers/{sid}/auto"
+    assert client.put(url, json={"enabled": True, "hour": 24}, headers=H).status_code == 422
+    assert client.put(url, json={"enabled": True, "minute": -1}, headers=H).status_code == 422
+    assert client.put(url, json={"enabled": True, "days": [7]}, headers=H).status_code == 400
+    # what the server reports is shown, and a server with automatic updates on can't be deleted by accident
+    status = {"enabled": True, "conf": {"hour": "3"}, "last": {"state": "partial", "packages": "4",
+              "containers": "web db", "reboot": "1", "finished": "1"}, "tz": "CET +0100", "helper": "1"}
+    db.ex("UPDATE servers SET auto_enabled=1, auto_config=?, auto_state=? WHERE id=?",
+          (_json.dumps({"hour": 3, "minute": 5, "days": [1, 4], "containers": True}), _json.dumps(status), sid))
+    a = next(x for x in client.get("/api/servers").json() if x["id"] == sid)["auto"]
+    assert a["enabled"] and a["schedule"] == "on Mon, Thu at 03:05" and a["helper_ok"]
+    assert a["last_text"] == ("Installed 4 updates; updated containers web, db; "
+                              "updating some containers failed; rebooted the server.")
+    r = client.delete(f"/api/servers/{sid}", headers=H)
+    assert r.status_code == 409 and "Turn them off first" in r.json()["detail"]
+    db.ex("UPDATE servers SET auto_enabled=0 WHERE id=?", (sid,))
+
+
+def test_setup_script_installs_the_auto_update_script(client):
+    script = client.get("/api/ssh-key?username=patchrack").json()["setup_script"]
+    assert "/usr/local/sbin/patchrack-auto-update" in script and "$HELPER, $AUTO" in script
+    assert "\nPRAUTO\n" in script and "patchrack-auto-update $HELPER_VERSION" in script
+    assert "nothing was changed" in script          # a failing visudo check now stops the script
 
 
 def test_failed_logins_are_rate_limited(client):

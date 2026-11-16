@@ -10,6 +10,7 @@ Patchrack is a small self-hosted web app that keeps the Linux servers in your ho
 - **Your call on reboots:** for each update you choose to not reboot, reboot only if required, or always reboot. Patchrack waits for the server to come back and confirms it's up to date.
 - **Live progress:** the apt and Docker output streams into the browser while it works. Close the panel and the job keeps running.
 - **Groups:** sort your servers into groups, for example by location or by what they run, and check or update a whole group at once.
+- **Automatic updates:** switch a server to automatic updates and it installs them itself, from a cron job at the time you choose, optionally followed by its Docker Compose containers. Patchrack reads the results and tells you what happened.
 - **Release upgrades:** spots when a new Ubuntu or Debian release is available, for example Ubuntu 26.04 LTS or Debian 13, and upgrades the server when you choose to, with safety checks first.
 - **Docker containers:** shows whether Docker is active, how many containers run and which have a newer image. Update them all or pick them by hand, and clean up unused images to free disk space.
 - **Notifications:** Pushover and Prowl, for new updates, finished or failed updates, new releases and unreachable servers.
@@ -38,7 +39,7 @@ You need Docker with the Compose plugin on the machine that runs Patchrack. It r
 Download the newest `Patchrack_vX.Y.Z.zip` from the [Releases page](../../releases/latest) and unpack it. It contains a `patchrack` folder; this is your Patchrack folder from now on.
 
 ```bash
-unzip Patchrack_v0.2.1.zip
+unzip Patchrack_v0.3.0.zip
 cd patchrack
 ```
 
@@ -92,15 +93,17 @@ The setup command:
 
 - creates a `patchrack` user and adds Patchrack's public key to it
 - installs `/usr/local/sbin/patchrack-release-upgrade`, the script that runs release upgrades (see [Release upgrades](#release-upgrades))
-- adds `/etc/sudoers.d/patchrack`, which lets that user run only `apt-get`, `dpkg --configure -a`, `systemctl reboot`, the release upgrade script and, when Docker is installed, `docker`, without a password. The file is checked with `visudo` before it's installed.
+- installs `/usr/local/sbin/patchrack-auto-update`, the script for automatic updates (see [Automatic updates](#automatic-updates)). It does nothing until you turn automatic updates on.
+- adds `/etc/sudoers.d/patchrack`, which lets that user run only `apt-get`, `dpkg --configure -a`, `systemctl reboot`, the release upgrade and automatic update scripts and, when Docker is installed, `docker`, without a password. The file is checked with `visudo` before it's installed.
 
-It doesn't change existing users, passwords, SSH settings or anything else. If you install Docker later, or after updating Patchrack to 0.2.0 or newer, run the command again. Running it twice is safe.
+It doesn't change existing users, passwords, SSH settings or anything else. If you install Docker later, or after updating Patchrack to a version that adds a script (0.2.0, 0.3.0), run the command again. Running it twice is safe.
 
 To remove Patchrack's access from a server:
 
 ```bash
+patchrack-auto-update disable 2>/dev/null
 userdel -r patchrack
-rm /etc/sudoers.d/patchrack /usr/local/sbin/patchrack-release-upgrade
+rm /etc/sudoers.d/patchrack /usr/local/sbin/patchrack-release-upgrade /usr/local/sbin/patchrack-auto-update
 ```
 
 If you'd rather use your own user and key, choose **Use my own private key** and pick how sudo works for that user.
@@ -121,6 +124,22 @@ Choose **Groups…** above the server list to create, rename and delete groups a
 - **History** keeps every check and update with its full log.
 
 ![Updating a server](docs/screenshots/update.png)
+
+## Automatic updates
+
+Each server in the list has an **Auto-update** switch. Turn it on, choose a time and the days, and the server installs its updates by itself from then on, even when Patchrack isn't running.
+
+- **How:** Patchrack writes a cron job to `/etc/cron.d/patchrack-auto-update` (and the settings to `/etc/patchrack/auto-update.conf`) through `/usr/local/sbin/patchrack-auto-update`. If cron isn't installed, it's installed. The time is in the server's system time zone (`timedatectl`), which is the one cron uses; Patchrack shows it next to the schedule.
+- **A run:** `apt-get update`, then `apt-get dist-upgrade` or `upgrade` and `autoremove`, as set in the server's settings. Changed configuration files you edited are kept. If you change the upgrade mode or autoremove later, Patchrack updates the server's settings for you.
+- **Reboots:** when an update needs one (`/var/run/reboot-required`), the server reboots right after the run. It never reboots after a failed update.
+- **Docker containers (optional):** after a successful system update, the server pulls new images for the services that are running in its Docker Compose projects (`docker compose pull`) and recreates only the services that got a new image (`docker compose up -d --no-deps`), plus containers that share their network (`network_mode: service:...`). Edits to a Compose file you haven't applied yet stay unapplied, and services you stopped stay stopped. Containers not started with Compose are left alone; update those from Patchrack's Docker section. Unused old images are removed with `docker image prune`. There's no automatic rollback here, unlike updates from Patchrack, so pin image tags for containers that must not change by surprise.
+- **Patchrack's own checks:** for a server with automatic updates on, scheduled checks, **Check all** and **Check group** only read the result of the last run (and what's still pending, without refreshing the package lists). They don't look for container or release updates and don't remind you of waiting updates for that server. **Check** on the server itself still does a full check.
+- **Notifications:** a run that installed something, updated containers or rebooted is reported as finished; a failed, partly failed or skipped run as failed. Patchrack sees a run at its next check of that server; if several runs happen between two checks, it reports the last one.
+- **Logs:** open the server and choose **Show log**. On the server: `/var/log/patchrack-auto-update.log` (the run before is `.log.1`) and the result in `/var/lib/patchrack/auto-update.state`.
+- **Turning it off** removes the cron job and the settings from the server. The script itself stays, like the release upgrade script, so you can turn it on again without running the setup command. If you delete a server while automatic updates are on, remove the cron job yourself with `sudo patchrack-auto-update disable`.
+- **Not included:** release upgrades are never installed automatically. A run is skipped while a release upgrade is running.
+
+Servers set up before 0.3.0 need their setup command run again (open the server, **Setup command**) to install the script.
 
 ## Release upgrades
 
@@ -173,13 +192,13 @@ Updates don't touch your data. Your account, servers, settings and Patchrack's S
 
 ### Linux: the update script (recommended)
 
-1. Download the new `Patchrack_vX.Y.Z.zip` from the [Releases page](../../releases/latest) to the server. From Windows you can copy it over with `scp Patchrack_v0.2.1.zip you@server:~`.
+1. Download the new `Patchrack_vX.Y.Z.zip` from the [Releases page](../../releases/latest) to the server. From Windows you can copy it over with `scp Patchrack_v0.3.0.zip you@server:~`.
 2. Unpack it into a separate folder, next to your installation:
 
    ```bash
    cd ~
    rm -rf patchrack-update
-   unzip -q Patchrack_v0.2.1.zip -d patchrack-update
+   unzip -q Patchrack_v0.3.0.zip -d patchrack-update
    ```
 
 3. Run the update script from the new release, and give it your Patchrack folder:
@@ -190,10 +209,10 @@ Updates don't touch your data. Your account, servers, settings and Patchrack's S
 
    It shows which version you have and which you'll get, and asks before it changes anything. If Docker needs `sudo` on your server, put `sudo` in front of the command.
 
-4. When it says `Done: Patchrack 0.2.1 is running`, clean up:
+4. When it says `Done: Patchrack 0.3.0 is running`, clean up:
 
    ```bash
-   rm -rf ~/patchrack-update ~/Patchrack_v0.2.1.zip
+   rm -rf ~/patchrack-update ~/Patchrack_v0.3.0.zip
    ```
 
 What the script does:
@@ -233,7 +252,7 @@ In PowerShell, in your Patchrack folder:
 docker run --rm --user 0 -v patchrack_patchrack-data:/data -v "${PWD}\backups:/backup" patchrack:latest tar czf /backup/data-before-update.tgz -C /data .
 
 # 2. Unpack the new release over your installation
-Expand-Archive "$env:USERPROFILE\Downloads\Patchrack_v0.2.1.zip" -DestinationPath "$env:TEMP\patchrack-update" -Force
+Expand-Archive "$env:USERPROFILE\Downloads\Patchrack_v0.3.0.zip" -DestinationPath "$env:TEMP\patchrack-update" -Force
 Copy-Item "$env:TEMP\patchrack-update\patchrack\*" . -Recurse -Force
 
 # 3. Build and start the new version

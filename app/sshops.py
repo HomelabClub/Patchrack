@@ -36,6 +36,8 @@ if [ -f /etc/rpi-issue ] || grep -qs raspberrypi.com /etc/apt/sources.list.d/*; 
 echo "ROOTFREE=$(df -Pk / 2>/dev/null | awk 'NR==2{print $4}')"
 echo "HELPER=$(/usr/local/sbin/patchrack-release-upgrade version 2>/dev/null | awk '{print $2}')"
 echo "UPGRADESTATE=$(/usr/local/sbin/patchrack-release-upgrade status 2>/dev/null | tr '\n' ';')"
+echo "AUTOHELPER=$(/usr/local/sbin/patchrack-auto-update version 2>/dev/null | awk '{print $2}')"
+echo "AUTOSTATUS=$(/usr/local/sbin/patchrack-auto-update status 2>/dev/null | tr '\n' ';')"
 """
 
 INST_RE = re.compile(r"^Inst (\S+)(?: \[([^\]]+)\])? \((\S+) (.*?)(?: \[[^\]]+\])?\)")
@@ -100,6 +102,8 @@ class Facts:
     root_free: int | None = None
     helper_version: str = ""
     upgrade_state: dict = field(default_factory=dict)
+    auto_helper: str = ""
+    auto_status: str = ""
 
     @property
     def security_count(self) -> int:
@@ -231,6 +235,8 @@ def _parse_probe(text: str, facts: Facts) -> None:
     facts.helper_version = kv.get("HELPER", "")
     state = dict(p.split("=", 1) for p in kv.get("UPGRADESTATE", "").split(";") if "=" in p)
     facts.upgrade_state = state if state.get("state") not in (None, "none") else {}
+    facts.auto_helper = kv.get("AUTOHELPER", "")
+    facts.auto_status = kv.get("AUTOSTATUS", "")
 
 
 def _parse_simulation(text: str, facts: Facts) -> None:

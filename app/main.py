@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import crypto, db, notify, release
+from . import autoupd, crypto, db, notify, release
 from .jobs import bus, get_server, manager, publish_server, run_scheduled_checks, scheduler_loop, server_public
 from .sshops import SSHOpError, HostKeyChanged, Target, connect, fingerprint, run, test_sudo
 
@@ -28,7 +28,7 @@ logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
 log = logging.getLogger("patchrack")
 logging.getLogger("asyncssh").setLevel(logging.WARNING)
 STATIC = Path(__file__).parent / "static"
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 # Where the source code of this build lives. AGPL section 13 asks that people using a
 # (modified) copy over the network can get its source, so the app links to it.
 SOURCE_URL = os.environ.get("PATCHRACK_SOURCE_URL", "").strip()
@@ -238,20 +238,29 @@ def update_server(sid: int, body: ServerIn, user: str = Depends(user_required)):
     if body.become == "sudo_password" and not body.sudo_password and not row["sudo_password_enc"]:
         raise HTTPException(400, "Enter the sudo password, or choose passwordless sudo")
     host_changed = (body.host.strip(), body.port) != (row["host"], row["port"])
+    reapply = row["auto_enabled"] and row["auto_config"] and (
+        body.upgrade_mode != row["upgrade_mode"] or bool(body.autoremove) != bool(row["autoremove"]))
     db.ex("UPDATE servers SET name=?,host=?,port=?,username=?,key_source=?,become=?,upgrade_mode=?,"
           "autoremove=?,reboot_policy=?,notes=?,group_id=?"
           + (",host_key=NULL,host_key_fp=NULL" if host_changed else "") + " WHERE id=?",
           (body.name.strip(), body.host.strip(), body.port, body.username, body.key_source, body.become,
            body.upgrade_mode, int(body.autoremove), body.reboot_policy, body.notes, body.group_id, sid))
     _save_secrets(sid, body)
+    if reapply and not manager.busy_job(sid):
+        # the server's cron job uses the upgrade mode and autoremove setting too: send the new ones
+        manager.start(sid, "auto_setup", "manual", {"enabled": True, **json.loads(row["auto_config"])})
     publish_server(sid)
     return server_public(get_server(sid))
 
 
 @app.delete("/api/servers/{sid}")
-def delete_server(sid: int, user: str = Depends(user_required)):
+def delete_server(sid: int, force: bool = False, user: str = Depends(user_required)):
     if manager.busy_job(sid):
         raise HTTPException(409, "Wait for the running job to finish first")
+    row = get_server(sid)
+    if row and row["auto_enabled"] and not force:
+        raise HTTPException(409, "Automatic updates are on for this server. Turn them off first, so the "
+                                 "cron job is removed from the server.")
     db.ex("DELETE FROM servers WHERE id=?", (sid,))
     bus.publish("server_deleted", {"id": sid})
     return {"ok": True}
@@ -438,7 +447,11 @@ def set_server_group(sid: int, body: ServerGroupIn, user: str = Depends(user_req
 
 @app.post("/api/groups/{gid}/check")
 async def check_group(gid: int, user: str = Depends(user_required)):
-    ids = [r["id"] for r in db.q("SELECT id FROM servers WHERE group_id=?", (gid,))]
+    if gid == 0:   # the servers without a (still existing) group
+        ids = [r["id"] for r in db.q("SELECT id FROM servers WHERE group_id IS NULL OR group_id NOT IN "
+                                     "(SELECT id FROM server_groups)")]
+    else:
+        ids = [r["id"] for r in db.q("SELECT id FROM servers WHERE group_id=?", (gid,))]
     if ids:
         asyncio.create_task(run_scheduled_checks("manual", ids))
     return {"ok": True, "servers": len(ids)}
@@ -482,6 +495,48 @@ async def follow_release_upgrade(sid: int, user: str = Depends(user_required)):
     if (rel.get("last") or {}).get("state") != "running":
         raise HTTPException(409, "No release upgrade is running on this server. Run a check to refresh.")
     return _start(sid, "release_upgrade", {"attach": True, "reboot": False})   # no reboot nobody asked for
+
+
+# ---- automatic updates ------------------------------------------------------------------
+class AutoIn(BaseModel):
+    enabled: bool
+    hour: int = Field(3, ge=0, le=23)
+    minute: int = Field(30, ge=0, le=59)
+    days: list[int] = Field(default_factory=list, max_length=7)   # cron numbers, 0 = Sunday; empty = every day
+    containers: bool = False
+
+
+@app.put("/api/servers/{sid}/auto")
+async def set_auto_updates(sid: int, body: AutoIn, user: str = Depends(user_required)):
+    row = get_server(sid)
+    if not row:
+        raise HTTPException(404, "Server not found")
+    if any(d < 0 or d > 6 for d in body.days):
+        raise HTTPException(400, "Days must be 0 (Sunday) to 6 (Saturday)")
+    if body.enabled and row["key_source"] == "app" and row["status"] == "unknown":
+        raise HTTPException(409, "Check the server first, so Patchrack knows it can reach it")
+    days = sorted(set(body.days))
+    return _start(sid, "auto_setup", {"enabled": body.enabled, "hour": body.hour, "minute": body.minute,
+                                      "days": [] if len(days) == 7 else days, "containers": body.containers})
+
+
+@app.get("/api/servers/{sid}/auto/log")
+async def auto_update_log(sid: int, previous: bool = False, user: str = Depends(user_required)):
+    row = get_server(sid)
+    if not row:
+        raise HTTPException(404, "Server not found")
+    path = "/var/log/patchrack-auto-update.log" + (".1" if previous else "")
+    try:
+        t = Target.from_row(row)
+        conn, _ = await connect(t)
+    except SSHOpError as exc:
+        raise HTTPException(502, str(exc))
+    try:
+        code, out = await run(conn, t, f"tail -n 1500 {path} 2>/dev/null || echo 'No log yet: {path}'",
+                              timeout=30)
+    finally:
+        conn.close()
+    return {"path": path, "text": out}
 
 
 @app.post("/api/check-all")
@@ -723,20 +778,28 @@ HELPER=/usr/local/sbin/patchrack-release-upgrade
 cat > "$HELPER.new" <<'PRHELPER'
 @HELPER_SOURCE@PRHELPER
 install -m 755 -o root -g root "$HELPER.new" "$HELPER"; rm -f "$HELPER.new"
+# Automatic updates: turned on and off from Patchrack; cron runs it on the server
+AUTO=/usr/local/sbin/patchrack-auto-update
+cat > "$AUTO.new" <<'PRAUTO'
+@AUTO_SOURCE@PRAUTO
+install -m 755 -o root -g root "$AUTO.new" "$AUTO"; rm -f "$AUTO.new"
 APT=$(command -v apt-get); DPKG=$(command -v dpkg); SCTL=$(command -v systemctl)
 DOCKER=$(command -v docker || true)
 T=$(mktemp)
 cat > "$T" <<EOF
-# Managed by Patchrack: lets $U run updates, release upgrades, manage Docker and reboot
+# Managed by Patchrack: lets $U run updates, automatic updates, release upgrades, Docker and reboot
 Defaults:$U env_keep += "DEBIAN_FRONTEND NEEDRESTART_MODE APT_LISTCHANGES_FRONTEND LC_ALL"
-$U ALL=(root) NOPASSWD: $APT, $DPKG --configure -a, $SCTL reboot, $HELPER${DOCKER:+, $DOCKER}
+$U ALL=(root) NOPASSWD: $APT, $DPKG --configure -a, $SCTL reboot, $HELPER, $AUTO${DOCKER:+, $DOCKER}
 EOF
-visudo -cf "$T" >/dev/null && install -m 440 -o root -g root "$T" /etc/sudoers.d/patchrack
+visudo -cf "$T" >/dev/null || { echo "The sudo rules didn't pass visudo's check; nothing was changed."; rm -f "$T"; exit 1; }
+install -m 440 -o root -g root "$T" /etc/sudoers.d/patchrack
 rm -f "$T"
 echo "Done: $U can now be managed by Patchrack${DOCKER:+ (including Docker)}."
 PATCHRACK"""
-    helper = release.HELPER_SOURCE if release.HELPER_SOURCE.endswith("\n") else release.HELPER_SOURCE + "\n"
-    return script.replace("@USER@", username).replace("@KEY@", pub).replace("@HELPER_SOURCE@", helper)
+    def nl(text: str) -> str:
+        return text if text.endswith("\n") else text + "\n"
+    return (script.replace("@USER@", username).replace("@KEY@", pub)
+            .replace("@HELPER_SOURCE@", nl(release.HELPER_SOURCE)).replace("@AUTO_SOURCE@", nl(autoupd.SOURCE)))
 
 
 # ---- frontend ---------------------------------------------------------------------------

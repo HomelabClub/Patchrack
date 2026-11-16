@@ -10,7 +10,7 @@ import secrets
 import time
 from dataclasses import dataclass, field
 
-from . import db, dockerops, notify, release
+from . import autoupd, db, dockerops, notify, release
 from .sshops import Facts, HostKeyChanged, SSHOpError, Target, connect, fingerprint, gather_facts, run, \
     wait_for_reboot, APT_OPTS
 
@@ -60,6 +60,9 @@ def server_public(row) -> dict:
                             and all(c["ok"] for c in rel["checks"]))
     d["release"] = rel
     d.pop("release_json", None)
+    d["auto"] = autoupd.public(row)
+    for k in ("auto_config", "auto_state", "auto_seen"):
+        d.pop(k, None)
     d["has_custom_key"] = bool(row["private_key_enc"])
     d["has_passphrase"] = bool(row["passphrase_enc"])
     d["has_sudo_password"] = bool(row["sudo_password_enc"])
@@ -159,7 +162,8 @@ class JobManager:
         self.by_server[sid] = job.id
         self._prune()
         runner = {"check": self._check, "update": self._update, "docker_update": self._docker_update,
-                  "docker_prune": self._docker_prune, "release_upgrade": self._release_upgrade}[kind]
+                  "docker_prune": self._docker_prune, "release_upgrade": self._release_upgrade,
+                  "auto_setup": self._auto_setup}[kind]
         job.task = asyncio.create_task(self._wrap(job, runner))
         bus.publish("job", job.public())
         publish_server(sid)
@@ -178,7 +182,7 @@ class JobManager:
                 job.status, job.summary = "failed", str(exc)
                 await job.log(str(exc), "error")
                 unreachable = str(exc).startswith("Could not reach")
-                if unreachable or not job.kind.startswith("docker"):
+                if unreachable or not (job.kind.startswith("docker") or job.kind == "auto_setup"):
                     self._mark_error(job.server_id, "unreachable" if unreachable else "error", str(exc))
             except asyncio.CancelledError:
                 job.status, job.summary = "failed", "Cancelled"
@@ -187,7 +191,8 @@ class JobManager:
                 log.exception("job %s crashed", job.id)
                 job.status, job.summary = "failed", f"Unexpected error: {exc}"
                 await job.log(job.summary, "error")
-                self._mark_error(job.server_id, "error", job.summary)
+                if job.kind != "auto_setup":
+                    self._mark_error(job.server_id, "error", job.summary)
         job.finished_at = time.time()
         job.phase = "Finished" if job.status == "success" else "Failed"
         async with job.cond:
@@ -249,27 +254,36 @@ class JobManager:
     async def _check(self, job: Job) -> None:
         row = get_server(job.server_id)
         t = Target.from_row(row)
+        read_only = bool(job.options.get("auto_read")) and bool(row["auto_enabled"])
         conn = await self._connect(job, t)
         apt_error = None
+        docker = rel = None
         try:
-            await job.set_phase("Refreshing package lists")
-            try:
-                facts = await gather_facts(conn, t, on_line=job.log)
-            except HostKeyChanged:
-                raise
-            except SSHOpError as exc:
-                apt_error = exc
-            docker = await self._check_docker(job, conn, t)
-            rel = None
-            if not apt_error:
-                await job.set_phase("Looking for a new release")
-                rel = await release.detect(conn, t, facts)
-                self._store_release(t.id, rel)
+            if read_only:
+                # automatic updates are on: only read what the server's own runs did
+                await job.set_phase("Reading the result of the automatic updates")
+                await job.log("Automatic updates are on for this server, so Patchrack only reads the "
+                              "results. Press Check on the server for a full check.", "info")
+                facts = await gather_facts(conn, t, refresh=False)
+            else:
+                await job.set_phase("Refreshing package lists")
+                try:
+                    facts = await gather_facts(conn, t, on_line=job.log)
+                except HostKeyChanged:
+                    raise
+                except SSHOpError as exc:
+                    apt_error = exc
+                docker = await self._check_docker(job, conn, t)
+                if not apt_error:
+                    await job.set_phase("Looking for a new release")
+                    rel = await release.detect(conn, t, facts)
+                    self._store_release(t.id, rel)
         finally:
             conn.close()
         if apt_error:
             raise apt_error
         self._store_facts(t.id, facts)
+        await self._store_auto(job, facts)
         job.result = {"pending": len(facts.packages), "security": facts.security_count,
                       "reboot_required": facts.reboot_required,
                       "container_updates": (docker or {}).get("updates", 0)}
@@ -279,6 +293,96 @@ class JobManager:
             job.summary = job.summary.rstrip(".") + f"; {u} container update{'' if u == 1 else 's'}."
         if rel and rel.get("available"):
             job.summary = job.summary.rstrip(".") + f"; {rel['target_name']} is available."
+        auto = autoupd.parse_status(facts.auto_status) if facts.auto_helper else {}
+        if row["auto_enabled"] and (auto.get("last") or {}).get("state") not in (None, "none", "running"):
+            job.summary = job.summary.rstrip(".") + ". Last automatic update: " + \
+                autoupd.describe_run(auto["last"]).rstrip(".").lower() + "."
+        await job.log(job.summary, "result")
+
+    # ---- automatic updates ----
+    async def _store_auto(self, job: Job, facts: Facts) -> None:
+        """Keep what the server reports about its automatic updates, and report new runs."""
+        row = get_server(job.server_id)
+        status = autoupd.parse_status(facts.auto_status) if facts.auto_helper else {}
+        status["helper"] = facts.auto_helper or None
+        db.ex("UPDATE servers SET auto_state=? WHERE id=?", (json.dumps(status), row["id"]))
+        last = status.get("last") or {}
+        if not row["auto_enabled"] or last.get("state") in (None, "none", "running"):
+            return
+        if status.get("enabled") is False:
+            await job.log("The server reports that its cron job for automatic updates is missing. "
+                          "Turn automatic updates off and on again in Patchrack.", "error")
+        key = autoupd.run_key(last)
+        if key == row["auto_seen"]:
+            return
+        db.ex("UPDATE servers SET auto_seen=? WHERE id=?", (key, row["id"]))
+        if row["auto_seen"] is None and job.options.get("auto_setup"):
+            return                      # a run from before automatic updates were turned on here
+        text = autoupd.describe_run(last)
+        await job.log(f"New automatic update result: {text}", "info")
+        self._mark_auto_updated_containers(row, (last.get("containers") or "").split())
+        if last.get("state") in ("failed", "partial"):
+            await notify.event("update_failed", f"{row['name']}: automatic update failed", text, 1)
+        elif last.get("state") == "skipped":
+            await notify.event("update_failed", f"{row['name']}: automatic update skipped", text)
+        elif int(last.get("packages") or 0) or last.get("containers") or last.get("reboot") == "1":
+            await notify.event("update_done", f"{row['name']}: automatic update finished", text)
+
+    def _mark_auto_updated_containers(self, row, names: list[str]) -> None:
+        """Containers the server's own run recreated are current now; the last Docker check doesn't know."""
+        if not names or not row["docker_json"]:
+            return
+        info = json.loads(row["docker_json"])
+        for c in info.get("containers", []):
+            if c.get("name") in names and c.get("check") == "update":
+                c["check"], c["note"] = "current", "Updated by the automatic update"
+        info["updates"] = sum(1 for c in info.get("containers", []) if c.get("check") == "update")
+        db.ex("UPDATE servers SET docker_json=?, docker_updates=? WHERE id=?",
+              (json.dumps(info), info["updates"], row["id"]))
+
+    async def _auto_setup(self, job: Job) -> None:
+        opts = job.options
+        row = get_server(job.server_id)
+        t = Target.from_row(row)
+        conn = await self._connect(job, t)
+        try:
+            code, out = await run(conn, t, f"{autoupd.PATH} version", timeout=20)
+            have = out.split()[-1] if code == 0 and out.split() else ""
+            if not have.isdigit() or int(have) < autoupd.VERSION:
+                raise SSHOpError(f"The automatic update script isn't installed on {row['name']}. Open the "
+                                 f"server, choose Setup command, run it on the server as root, and try again.")
+            if opts["enabled"]:
+                cfg = {"hour": opts["hour"], "minute": opts["minute"], "days": opts["days"],
+                       "containers": opts["containers"]}
+                await job.set_phase("Turning on automatic updates")
+                cmd = (f"{autoupd.PATH} enable {cfg['minute']} {cfg['hour']} '{autoupd.cron_days(cfg['days'])}' "
+                       f"{'full' if row['upgrade_mode'] == 'full' else 'safe'} {int(bool(row['autoremove']))} "
+                       f"{int(cfg['containers'])}")
+                await job.log(f"$ sudo {cmd}", "cmd")
+                code, out = await run(conn, t, cmd, root=True, on_line=job.log, timeout=600)
+                if code != 0:
+                    raise SSHOpError(out.strip().splitlines()[-1] if out.strip() else f"exit {code}")
+                db.ex("UPDATE servers SET auto_enabled=1, auto_config=? WHERE id=?", (json.dumps(cfg), t.id))
+            else:
+                await job.set_phase("Turning off automatic updates")
+                await job.log(f"$ sudo {autoupd.PATH} disable", "cmd")
+                code, out = await run(conn, t, f"{autoupd.PATH} disable", root=True, on_line=job.log, timeout=60)
+                if code != 0:
+                    raise SSHOpError(out.strip().splitlines()[-1] if out.strip() else f"exit {code}")
+                db.ex("UPDATE servers SET auto_enabled=0 WHERE id=?", (t.id,))
+            facts = await gather_facts(conn, t, refresh=False)
+        finally:
+            conn.close()
+        self._store_facts(t.id, facts)
+        job.options["auto_setup"] = True
+        await self._store_auto(job, facts)
+        a = autoupd.public(get_server(t.id))
+        if opts["enabled"]:
+            job.summary = (f"Automatic updates are on: {a['schedule']} ({a['tz'] or 'server time'})"
+                           + (", with Docker Compose containers" if opts["containers"] else "")
+                           + ". The server reboots by itself when an update needs it.")
+        else:
+            job.summary = "Automatic updates are off. The cron job and its settings were removed from the server."
         await job.log(job.summary, "result")
 
     def _store_release(self, sid: int, info: dict) -> None:
@@ -607,7 +711,8 @@ REMINDER_GAP = 20 * 3600
 
 
 async def run_scheduled_checks(trigger: str = "schedule", server_ids: list[int] | None = None) -> None:
-    rows = db.q("SELECT id, status, pending_count, docker_json, release_json FROM servers ORDER BY name")
+    rows = db.q("SELECT id, status, pending_count, docker_json, release_json, auto_enabled FROM servers "
+                "ORDER BY name")
     if server_ids is not None:
         rows = [r for r in rows if r["id"] in server_ids]
     before = {r["id"]: (r["status"], r["pending_count"]) for r in rows}
@@ -616,7 +721,8 @@ async def run_scheduled_checks(trigger: str = "schedule", server_ids: list[int] 
     jobs = []
     for r in rows:
         try:
-            jobs.append(manager.start(r["id"], "check", trigger))
+            jobs.append(manager.start(r["id"], "check", trigger,
+                                      {"auto_read": True} if r["auto_enabled"] else None))
         except RuntimeError:
             continue
     if not jobs:
@@ -630,7 +736,8 @@ async def run_scheduled_checks(trigger: str = "schedule", server_ids: list[int] 
     # list everything that is waiting, on every server, and note whether any of it is new
     for row in db.q("SELECT * FROM servers ORDER BY name COLLATE NOCASE"):
         prev_status, prev_count = before.get(row["id"], ("unknown", 0))
-        if row["status"] == "updates":
+        auto = bool(row["auto_enabled"])       # its own cron job installs these
+        if row["status"] == "updates" and not auto:
             sec = f", {row['security_count']} security" if row["security_count"] else ""
             n = row["pending_count"]
             sys_lines.append(f"{row['name']}: {n} update{'' if n == 1 else 's'}{sec}")
@@ -641,7 +748,7 @@ async def run_scheduled_checks(trigger: str = "schedule", server_ids: list[int] 
         target = _release_target(row["release_json"])
         if row["id"] in checked and target and target != release_before.get(row["id"]):
             new_releases.append(f"{row['name']}: {target}")
-        now_c = _container_updates(row["docker_json"])
+        now_c = set() if auto else _container_updates(row["docker_json"])
         if now_c:
             ct_lines.append(f"{row['name']}: {', '.join(sorted(now_c))}")
             if row["id"] in checked and now_c - containers_before.get(row["id"], set()):

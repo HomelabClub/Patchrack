@@ -98,3 +98,55 @@ def test_sent_message_is_logged_with_each_result(monkeypatch):
     row = _last_log()
     assert row["note"] is None
     assert '"pushover": [true, "Sent"]' in row["results"] and "invalid API key" in row["results"]
+
+
+# ---- automatic updates: each finished run is reported once ----------------------------
+def _auto_server():
+    sid = db.ex("INSERT INTO servers(name,host,username,created_at,auto_enabled) VALUES('autobox','10.9.9.9','u',?,1)",
+                (time.time(),))
+    return sid
+
+
+def _facts(last: str):
+    f = jobs.Facts()
+    f.auto_helper = "1"
+    f.auto_status = "enabled=1;conf_hour=3;" + last + ";tz=CET +0100;cron=1"
+    return f
+
+
+def test_auto_update_runs_are_reported_once(sent):
+    sid = _auto_server()
+    job = jobs.Job(id="t1", server_id=sid, server_name="autobox", kind="check", trigger="schedule", options={})
+    ok = "state=success;packages=3;containers=web;reboot=1;finished=100"
+    asyncio.run(jobs.manager._store_auto(job, _facts(ok)))
+    assert sent == [("update_done", "autobox: automatic update finished",
+                     "Installed 3 updates; updated container web; rebooted the server.")]
+    asyncio.run(jobs.manager._store_auto(job, _facts(ok)))           # same run, next check
+    assert len(sent) == 1
+    asyncio.run(jobs.manager._store_auto(job, _facts("state=success;packages=0;containers=;reboot=0;finished=200")))
+    assert len(sent) == 1                                             # nothing changed: stay quiet
+    asyncio.run(jobs.manager._store_auto(job, _facts("state=failed;exit=1;packages=2;finished=300")))
+    assert sent[-1][0] == "update_failed" and "failed" in sent[-1][2]
+    db.ex("DELETE FROM servers WHERE id=?", (sid,))
+
+
+def test_auto_update_runs_are_not_reported_when_off(sent):
+    sid = _auto_server()
+    db.ex("UPDATE servers SET auto_enabled=0 WHERE id=?", (sid,))
+    job = jobs.Job(id="t2", server_id=sid, server_name="autobox", kind="check", trigger="schedule", options={})
+    asyncio.run(jobs.manager._store_auto(job, _facts("state=failed;exit=1;finished=1")))
+    assert sent == []
+    db.ex("DELETE FROM servers WHERE id=?", (sid,))
+
+
+def test_containers_updated_by_a_run_no_longer_show_as_waiting(sent):
+    import json
+    sid = _auto_server()
+    db.ex("UPDATE servers SET docker_updates=2, docker_json=? WHERE id=?", (json.dumps({"updates": 2, "containers": [
+        {"name": "web", "check": "update"}, {"name": "plain", "check": "update"}, {"name": "db", "check": "current"}]}), sid))
+    job = jobs.Job(id="t3", server_id=sid, server_name="autobox", kind="check", trigger="schedule", options={})
+    asyncio.run(jobs.manager._store_auto(job, _facts("state=success;packages=0;containers=web;reboot=0;finished=5")))
+    info = json.loads(db.q1("SELECT docker_json FROM servers WHERE id=?", (sid,))["docker_json"])
+    assert [c["check"] for c in info["containers"]] == ["current", "update", "current"]   # 'plain' isn't from Compose
+    assert db.q1("SELECT docker_updates FROM servers WHERE id=?", (sid,))["docker_updates"] == 1
+    db.ex("DELETE FROM servers WHERE id=?", (sid,))

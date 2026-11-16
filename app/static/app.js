@@ -62,8 +62,8 @@ function fmtBytes(n) {
   while (Math.abs(n) >= 1000 && i < u.length - 1) { n /= 1000; i++; }
   return i < 2 ? `${Math.round(n)} ${u[i]}` : `${n.toFixed(1)} ${u[i]}`;
 }
-const JOB_VERB = { check: "Checking", update: "Updating", docker_update: "Updating containers on", docker_prune: "Cleaning up Docker on", release_upgrade: "Upgrading the release of" };
-const JOB_NOUN = { check: "Check", update: "Update", docker_update: "Container update", docker_prune: "Docker clean-up", release_upgrade: "Release upgrade" };
+const JOB_VERB = { check: "Checking", update: "Updating", docker_update: "Updating containers on", docker_prune: "Cleaning up Docker on", release_upgrade: "Upgrading the release of", auto_setup: "Changing automatic updates on" };
+const JOB_NOUN = { check: "Check", update: "Update", docker_update: "Container update", docker_prune: "Docker clean-up", release_upgrade: "Release upgrade", auto_setup: "Automatic updates" };
 function shortRelease(name) { return String(name || "").replace(/^(Ubuntu|Debian) /, ""); }
 function groupName(id) { const g = S.groups.find((x) => x.id === id); return g ? g.name : ""; }
 function containerUpdates(s) { return s.docker_status === "ok" && s.docker ? s.docker.updates || 0 : 0; }
@@ -109,7 +109,7 @@ function statusOf(s) {
   const job = s.busy && S.jobs.get(s.busy);
   if (s.busy) {
     const kind = job ? job.kind : "check";
-    const label = { check: "Checking…", update: "Updating…", docker_update: "Updating containers…", docker_prune: "Cleaning up Docker…", release_upgrade: "Upgrading release…" }[kind] || "Working…";
+    const label = { check: "Checking…", update: "Updating…", docker_update: "Updating containers…", docker_prune: "Cleaning up Docker…", release_upgrade: "Upgrading release…", auto_setup: "Setting up automatic updates…" }[kind] || "Working…";
     return { led: "busy", cls: "busy", label, sub: job ? job.phase : "" };
   }
   const cu = containerUpdates(s);
@@ -283,7 +283,7 @@ function renderServers() {
 }
 
 /* ---------- groups in the server list ---------- */
-const RACK_HEAD = `<div class="rack-head" aria-hidden="true"><span></span><span>Server</span><span>System</span><span>Status</span><span>Checked</span><span></span></div>`;
+const RACK_HEAD = `<div class="rack-head" aria-hidden="true"><span></span><span>Server</span><span>System</span><span>Status</span><span>Checked</span><span>Auto-update</span><span></span></div>`;
 
 function sectionKey(s) { return S.groups.length ? String(s.group_id ?? "none") : "all"; }
 
@@ -344,8 +344,7 @@ async function groupAction(act, key) {
     $(`[data-group="${key}"] [data-gact="toggle"]`)?.focus();
   } else if (act === "check") {
     try {
-      if (key === "none") for (const s of servers) { if (!s.busy) await api("POST", `/api/servers/${s.id}/check`); }
-      else await api("POST", `/api/groups/${key}/check`);
+      await api("POST", `/api/groups/${key === "none" ? 0 : key}/check`);
       toast(`Checking ${plural(servers.length, "server")}`);
     } catch (err) { toast(err.message, "bad"); }
   } else if (act === "update") {
@@ -387,6 +386,7 @@ function unitHTML(s) {
       <span class="os"><span>${esc(s.os_name || "—")}</span><small>${s.kernel ? esc(s.kernel) : ""}</small>${releaseTag(s)}</span>
       <span class="state ${st.cls}"><b>${esc(st.label)}</b><span class="sub ${s.status === "updates" && s.security_count && !s.busy ? "sec" : ""}">${esc(st.sub)}</span></span>
       <span class="seen">${ago(s.last_check_at)}</span>
+      ${autoSwitchHTML(s)}
       <span class="acts">
         ${s.busy ? `<button class="btn small" data-act="watch">View progress</button>` : `
         <button class="btn small" data-act="check">Check</button>
@@ -419,6 +419,7 @@ function detailHTML(s) {
   if (s.kept_back.length) body += `<div class="notice">Held back by apt: <span class="mono">${esc(s.kept_back.join(", "))}</span></div>`;
   if (s.status === "up_to_date" && !s.reboot_required) body += `<div class="notice ok">All packages are current. Last checked ${fmtTime(s.last_check_at)}.</div>`;
   if (s.notes) body += `<div class="muted">${esc(s.notes)}</div>`;
+  body += autoHTML(s);
   body += releaseHTML(s);
   body += dockerHTML(s);
   return `<div class="unit-detail">
@@ -554,7 +555,7 @@ function bindRack() {
     if (!unit) return;
     const id = +unit.dataset.id, s = S.servers.get(id);
     const act = e.target.closest("[data-act]")?.dataset.act;
-    if (act) { e.stopPropagation(); return unitAction(act, s); }
+    if (act) { e.stopPropagation(); if (act === "auto") e.preventDefault(); return unitAction(act, s); }
     if (e.target.closest("[data-toggle]")) toggleUnit(id);
   });
   rack.addEventListener("change", (e) => {
@@ -597,6 +598,9 @@ async function unitAction(act, s) {
     else if (act === "release-follow") { const j = await api("POST", `/api/servers/${s.id}/release-upgrade/follow`); S.jobs.set(j.id, j); openJob(j.id); }
     else if (act === "edit") openEditor(s);
     else if (act === "setup") openSetup(s);
+    else if (act === "auto") toggleAuto(s);
+    else if (act === "auto-edit") openAuto(s);
+    else if (act === "auto-log") openAutoLog(s);
     else if (act === "history") { location.hash = "#/history"; S.historyFilter = s.id; }
     else if (act === "forget") { await api("POST", `/api/servers/${s.id}/forget-host-key`); toast("Host key cleared. The next connection will trust the new key."); }
   } catch (err) { toast(err.message, "bad"); }
@@ -751,6 +755,8 @@ function openJob(jobId) {
     } else if (j.kind === "docker_update") {
       good = ok && !r.remaining;
       title = ok ? (good ? "All containers are up to date" : "Containers updated") : (r.updated && r.updated.length ? "Some containers failed to update" : "Container update failed");
+    } else if (j.kind === "auto_setup") {
+      good = ok; title = ok ? (j.summary.startsWith("Automatic updates are on") ? "Automatic updates are on" : "Automatic updates are off") : "Automatic updates weren't changed";
     } else if (j.kind === "release_upgrade") {
       good = ok; title = ok ? "Release upgrade finished" : "Release upgrade failed";
     } else if (j.kind === "docker_prune") {
@@ -761,6 +767,119 @@ function openJob(jobId) {
       <div><b>${esc(title)}</b>
       <span>${esc(j.kind === "docker_prune" && ok ? j.summary.replace(/^Freed [\d.]+ [KMGT]?B\.\s*/, "") : j.summary)}</span></div></div>`;
   });
+}
+
+/* ---------- automatic updates ---------- */
+const DAYS = [[1, "Mon"], [2, "Tue"], [3, "Wed"], [4, "Thu"], [5, "Fri"], [6, "Sat"], [0, "Sun"]];
+const pad2 = (n) => String(n).padStart(2, "0");
+function hasDocker(s) { return s.docker_status && !["none", "unknown"].includes(s.docker_status); }
+
+function autoSwitchHTML(s) {
+  const a = s.auto || {};
+  const on = !!a.enabled;
+  const when = on && a.config ? `${pad2(a.config.hour)}:${pad2(a.config.minute)}` : "Off";
+  return `<span class="auto-cell"><label class="switch mini" data-act="auto" title="${on ? `Automatic updates ${esc(a.schedule)}` : "Automatic updates are off"}">
+    <input type="checkbox" role="switch" ${on ? "checked" : ""} ${s.busy ? "disabled" : ""} aria-label="Automatic updates for ${esc(s.name)}"><span class="track"></span>
+    <span class="auto-when">${when}</span></label></span>`;
+}
+
+function autoOverdue(a) {
+  // no run seen for longer than the biggest gap between scheduled days, plus a margin
+  if (!a.enabled || !a.config) return false;
+  const days = a.config.days && a.config.days.length ? [...a.config.days].sort() : [0, 1, 2, 3, 4, 5, 6];
+  let gap = 7;
+  if (days.length > 1) gap = Math.max(...days.map((d, i) => ((days[(i + 1) % days.length] - d + 7) % 7) || 7));
+  const last = a.last ? +(a.last.finished || a.last.started || 0) : 0;
+  const since = Math.max(last, a.enabled_at || 0);
+  return since > 0 && Date.now() / 1000 - since > gap * 86400 + 3 * 3600;
+}
+
+function autoHTML(s) {
+  const a = s.auto || {};
+  if (!a.enabled && !a.last) return "";
+  const l = a.last;
+  let html = `<div class="auto-head"><h3>Automatic updates</h3>
+    <span class="muted">${a.enabled ? `On, ${esc(a.schedule)}${a.tz ? ` (${esc(a.tz.split(" ")[0])}, server time)` : " (server time)"}${a.config?.containers ? ", with Compose containers" : ""}. Reboots when an update needs it.` : "Off."}</span></div>`;
+  if (l) {
+    const when = l.state === "running" ? `running now, started ${ago(+l.started)}` : `${ago(+(l.finished || l.started))}`;
+    const cls = { success: "ok", partial: "warn", failed: "bad", skipped: "warn", running: "busy" }[l.state] || "";
+    html += `<div class="auto-last"><span class="led ${cls}"></span><span><b>Last run ${esc(when)}</b>${a.last_text ? `<br>${esc(a.last_text)}` : ""}</span></div>`;
+  } else if (a.enabled) {
+    html += `<div class="muted" style="font-size:13.5px">No run yet. The first one is ${esc(a.schedule)}.</div>`;
+  }
+  if (a.enabled && a.server_enabled === false) html += `<div class="notice bad">The server reports that its cron job for automatic updates is missing. Turn automatic updates off and on again.</div>`;
+  else if (a.enabled && autoOverdue(a)) html += `<div class="notice warn">No automatic update has run on schedule for a while. Check that cron is running on the server: <span class="mono">systemctl status cron</span>.</div>`;
+  html += `<div class="acts" style="display:flex;gap:8px;flex-wrap:wrap">${a.enabled ? `<button class="btn small" data-act="auto-edit">Change schedule…</button>` : ""}${l ? `<button class="btn small ghost" data-act="auto-log">Show log</button>` : ""}</div>`;
+  return `<section class="auto" id="auto-${s.id}">${html}</section>`;
+}
+
+async function toggleAuto(s) {
+  if (s.busy) return;
+  if (!s.auto?.enabled) return openAuto(s);
+  if (!(await confirmBox(`Turn off automatic updates for ${s.name}?`, "Patchrack removes the cron job and its settings from the server. After that, Patchrack checks this server on its own schedule again.", "Turn off"))) return;
+  try { const j = await api("PUT", `/api/servers/${s.id}/auto`, { enabled: false }); S.jobs.set(j.id, j); openJob(j.id); }
+  catch (err) { toast(err.message, "bad"); }
+}
+
+function openAuto(s) {
+  const a = s.auto || {};
+  const cfg = a.config || { hour: 3, minute: 30, days: [], containers: false };
+  const every = !cfg.days || !cfg.days.length;
+  const docker = hasDocker(s);
+  const sheet = openSheet(`
+    <div class="sheet-head"><div><h2>Automatic updates for ${esc(s.name)}</h2>
+      <p>The server installs its updates itself, from a cron job, at the time you choose.</p></div>
+      <button class="btn ghost small" data-close>Close</button></div>
+    <div class="sheet-body">
+      ${a.helper_ok ? "" : `<div class="notice warn">Patchrack hasn't found the automatic update script on this server. If you haven't yet, run this server's setup command again first; it installs the script.
+        <br><button class="btn small" id="auSetup">Show setup command</button></div>`}
+      <div class="row2 auto-time">
+        <div class="field"><label for="auTime">Time</label><input id="auTime" type="time" value="${pad2(cfg.hour)}:${pad2(cfg.minute)}" required>
+          <span class="hint">The server's own time${a.tz ? `: ${esc(a.tz.split(" ")[0])}` : ""}.</span></div>
+      </div>
+      <div class="field"><span class="label">Days</span>
+        <div class="day-picks">${DAYS.map(([n, label]) => `<label class="day"><input type="checkbox" value="${n}" ${every || cfg.days.includes(n) ? "checked" : ""}><span>${label}</span></label>`).join("")}</div>
+        <span class="hint" id="auDaysHint"></span></div>
+      ${docker ? `<label class="check"><input type="checkbox" id="auCt" ${cfg.containers ? "checked" : ""}>
+        <span><b>Also update Docker containers</b><br><span class="muted">After a successful system update, the server pulls new images for the running services of its Docker Compose projects and recreates only the containers that got a new image. Edits to Compose files you haven't applied stay unapplied, stopped services stay stopped, and containers not started with Compose are left alone. Unused old images are removed.</span></span></label>` : ""}
+      <div><div class="section-title">What happens</div><ul class="steps">
+        <li><span class="led ok"></span><span>The server runs <span class="mono">apt-get ${s.upgrade_mode === "full" ? "dist-upgrade" : "upgrade"}</span>${s.autoremove ? " and removes packages that are no longer needed" : ""}, as set in this server's settings.</span></li>
+        <li><span class="led warn"></span><span>When an update needs a reboot, the server reboots by itself right after the run.</span></li>
+        <li><span class="led ok"></span><span>Patchrack no longer checks this server for updates on its schedule. It reads the result of each run instead and lets you know when a run changed something or failed. <b>Check</b> on the server still does a full check.</span></li>
+        <li><span class="led ok"></span><span>Release upgrades, such as a new Ubuntu version, are never installed automatically.</span></li>
+      </ul></div>
+    </div>
+    <div class="sheet-foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="auGo">${a.enabled ? "Save schedule" : "Turn on automatic updates"}</button></div>`);
+  $("#auSetup", sheet)?.addEventListener("click", () => openSetup(s));
+  const days = () => $$(".day-picks input:checked", sheet).map((i) => +i.value);
+  const sync = () => {
+    const d = days();
+    $("#auGo", sheet).disabled = !d.length || !$("#auTime", sheet).value;
+    $("#auDaysHint", sheet).textContent = !d.length ? "Choose at least one day." : d.length === 7 ? "Every day." : "";
+  };
+  sheet.addEventListener("change", sync); sheet.addEventListener("input", sync); sync();
+  $("#auGo", sheet).onclick = async () => {
+    const [hour, minute] = $("#auTime", sheet).value.split(":").map(Number);
+    const d = days();
+    try {
+      const j = await api("PUT", `/api/servers/${s.id}/auto`, { enabled: true, hour, minute, days: d.length === 7 ? [] : d, containers: !!$("#auCt", sheet)?.checked });
+      S.jobs.set(j.id, j); openJob(j.id);
+    } catch (err) { toast(err.message, "bad"); }
+  };
+}
+
+async function openAutoLog(s, previous = false) {
+  const sheet = openSheet(`
+    <div class="sheet-head"><div><h2>Automatic update log for ${esc(s.name)}</h2><p id="alPath">Loading…</p></div>
+      <button class="btn ghost small" data-close>Close</button></div>
+    <div class="sheet-body"><pre class="log-pre" id="alText"></pre></div>
+    <div class="sheet-foot"><button class="btn" id="alOther">${previous ? "Show the last run" : "Show the run before"}</button><button class="btn" data-close>Done</button></div>`);
+  $("#alOther", sheet).onclick = () => openAutoLog(s, !previous);
+  try {
+    const r = await api("GET", `/api/servers/${s.id}/auto/log${previous ? "?previous=true" : ""}`);
+    $("#alPath", sheet).textContent = `${previous ? "The run before the last one" : "The last run"}, from ${r.path} on the server.`;
+    $("#alText", sheet).textContent = r.text || "(empty)";
+  } catch (err) { $("#alPath", sheet).textContent = err.message; }
 }
 
 /* ---------- setup command for one server ---------- */
@@ -1088,8 +1207,11 @@ async function openEditor(s) {
     closeSheet();
   });
   $("#del", sheet)?.addEventListener("click", async () => {
-    if (!(await confirmBox(`Delete ${s.name}?`, "Its stored credentials are removed from Patchrack. The server itself is not changed.", "Delete server", true))) return;
-    try { await api("DELETE", `/api/servers/${s.id}`); S.servers.delete(s.id); closeSheet(); renderServers(); toast(`${s.name} deleted`); }
+    const auto = S.servers.get(s.id)?.auto?.enabled;
+    if (auto) {
+      if (!(await confirmBox(`Automatic updates are on for ${s.name}`, "Turn them off first, so Patchrack removes the cron job from the server. If the server is gone for good, you can delete it anyway; on the server, the cron job is then removed with: sudo patchrack-auto-update disable", "Delete anyway", true))) return;
+    } else if (!(await confirmBox(`Delete ${s.name}?`, "Its stored credentials are removed from Patchrack. The server itself is not changed.", "Delete server", true))) return;
+    try { await api("DELETE", `/api/servers/${s.id}${auto ? "?force=true" : ""}`); S.servers.delete(s.id); closeSheet(); renderServers(); toast(`${s.name} deleted`); }
     catch (err) { toast(err.message, "bad"); }
   });
   // once a new server is saved, retries update it instead of creating a duplicate
@@ -1144,7 +1266,7 @@ async function renderHistory() {
   main.innerHTML = `<div class="page-head"><div><h1>History</h1><p>Every check and update, newest first.</p></div>
     <div class="fleet-actions"><select id="hf" aria-label="Filter by server" style="width:200px"><option value="">All servers</option>
       ${sortedServers().map((s) => `<option value="${s.id}" ${S.historyFilter === s.id ? "selected" : ""}>${esc(s.name)}</option>`).join("")}</select>
-      <select id="hk" aria-label="Filter by kind" style="width:150px"><option value="">Everything</option><option value="update">System updates</option><option value="docker_update">Container updates</option><option value="docker_prune">Docker clean-ups</option><option value="release_upgrade">Release upgrades</option><option value="check">Checks</option></select></div></div>
+      <select id="hk" aria-label="Filter by kind" style="width:150px"><option value="">Everything</option><option value="update">System updates</option><option value="docker_update">Container updates</option><option value="docker_prune">Docker clean-ups</option><option value="release_upgrade">Release upgrades</option><option value="auto_setup">Automatic updates</option><option value="check">Checks</option></select></div></div>
     <div class="list" id="hl"><div class="empty"><p>Loading…</p></div></div>`;
   const load = async () => {
     const sid = $("#hf").value;

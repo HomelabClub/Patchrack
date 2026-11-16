@@ -16,7 +16,8 @@ Only the latest release gets security fixes.
 
 - The Patchrack web app and its API
 - How Patchrack stores and uses credentials (master secret, encrypted values, sessions)
-- The server setup command and the sudo rule it installs
+- The server setup command, the sudo rule and the helper scripts it installs (`patchrack-release-upgrade`, `patchrack-auto-update`)
+- The cron job for automatic updates
 - How Patchrack connects to servers and to Docker
 
 ## What Patchrack assumes

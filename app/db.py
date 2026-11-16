@@ -136,6 +136,10 @@ MIGRATIONS = {
     "docker_error": "TEXT",
     "group_id": "INTEGER",                     # server_groups.id, NULL = no group
     "release_json": "TEXT",                    # result of the last release-upgrade check
+    "auto_enabled": "INTEGER NOT NULL DEFAULT 0",  # automatic updates by cron on the server
+    "auto_config": "TEXT",                     # {"hour", "minute", "days", "containers"}
+    "auto_state": "TEXT",                      # last `patchrack-auto-update status` read
+    "auto_seen": "TEXT",                       # last run that was reported (notifications)
 }
 
 
