@@ -1,65 +1,90 @@
-# When a version tag is pushed (for example: git tag v0.1.2 && git push origin v0.1.2) this
-# runs the tests, publishes the Docker image to GitHub Container Registry, and creates a
-# GitHub release with Patchrack_vX.Y.Z.zip attached and the changelog as release notes.
+# Releases a new version by itself. On every push to main it reads VERSION from app/main.py;
+# when there's no release for that version yet, it runs the tests, publishes the Docker image
+# to GitHub Container Registry, and creates the tag and the GitHub release with
+# Patchrack_vX.Y.Z.zip attached and the changelog as release notes.
+# So to release: raise VERSION, add a CHANGELOG section, push. (scripts/publish.ps1 does that
+# from a Patchrack zip.) You can also start it by hand under Actions > Release > Run workflow.
 name: Release
 
 on:
   push:
-    tags: ["v*.*.*"]
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write
   packages: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
-  image:
+  release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check that the tag matches the version in the app
+        with:
+          fetch-depth: 0
+      - name: Is this a new version?
+        id: version
         run: |
           version=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' app/main.py)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME doesn't match VERSION = \"$version\" in app/main.py"
-            exit 1
-          fi
+          if [ -z "$version" ]; then echo "::error::No VERSION in app/main.py"; exit 1; fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+            echo "Version $version is already released; nothing to do."
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Version $version is new: releasing it."
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/setup-python@v5
+        if: steps.version.outputs.new == 'true'
         with:
           python-version: "3.13"
-      - run: pip install -r requirements-dev.txt && python -m pytest -q
+      - name: Run the tests
+        if: steps.version.outputs.new == 'true'
+        run: pip install -r requirements-dev.txt && python -m pytest -q && node --check app/static/app.js
       - uses: docker/setup-qemu-action@v3
+        if: steps.version.outputs.new == 'true'
       - uses: docker/setup-buildx-action@v3
+        if: steps.version.outputs.new == 'true'
       - uses: docker/login-action@v3
+        if: steps.version.outputs.new == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+      - name: Image name (lowercase, as the registry requires)
+        if: steps.version.outputs.new == 'true'
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
       - uses: docker/build-push-action@v6
+        if: steps.version.outputs.new == 'true'
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            ${{ env.IMAGE }}:${{ env.VERSION }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
           build-args: |
             PATCHRACK_SOURCE_URL=${{ github.server_url }}/${{ github.repository }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Build the release zip
+        if: steps.version.outputs.new == 'true'
         run: git archive --format=zip --prefix=patchrack/ -o "Patchrack_v${VERSION}.zip" HEAD
-      - name: Create the GitHub release
+      - name: Create the tag and the GitHub release
+        if: steps.version.outputs.new == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           awk '/^## /{n++} n==1' CHANGELOG.md | tail -n +2 > release-notes.md
-          gh release create "$GITHUB_REF_NAME" "Patchrack_v${VERSION}.zip" \
+          gh release create "v${VERSION}" "Patchrack_v${VERSION}.zip" --target "$GITHUB_SHA" \
             --title "Patchrack ${VERSION}" --notes-file release-notes.md

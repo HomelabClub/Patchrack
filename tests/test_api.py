@@ -222,3 +222,13 @@ def test_failed_logins_are_rate_limited(client):
         assert client.post("/api/login", json={"username": "admin", "password": "wrong"}, headers=H).status_code == 401
     r = client.post("/api/login", json={"username": "admin", "password": PASSWORD}, headers=H)
     assert r.status_code == 429
+
+
+def test_browser_fetches_the_new_interface_after_an_update(client):
+    from app.main import VERSION
+    page = client.get("/servers")
+    assert page.headers["cache-control"] == "no-cache"
+    assert f'/static/app.js?v={VERSION}"' in page.text and f'/static/app.css?v={VERSION}"' in page.text
+    js = client.get(f"/static/app.js?v={VERSION}")
+    assert js.status_code == 200 and js.headers["cache-control"] == "no-cache"
+    assert client.get("/healthz").json()["version"] == VERSION

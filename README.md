@@ -39,7 +39,7 @@ You need Docker with the Compose plugin on the machine that runs Patchrack. It r
 Download the newest `Patchrack_vX.Y.Z.zip` from the [Releases page](../../releases/latest) and unpack it. It contains a `patchrack` folder; this is your Patchrack folder from now on.
 
 ```bash
-unzip Patchrack_v0.3.0.zip
+unzip Patchrack_v0.3.1.zip
 cd patchrack
 ```
 
@@ -192,13 +192,13 @@ Updates don't touch your data. Your account, servers, settings and Patchrack's S
 
 ### Linux: the update script (recommended)
 
-1. Download the new `Patchrack_vX.Y.Z.zip` from the [Releases page](../../releases/latest) to the server. From Windows you can copy it over with `scp Patchrack_v0.3.0.zip you@server:~`.
+1. Download the new `Patchrack_vX.Y.Z.zip` from the [Releases page](../../releases/latest) to the server. From Windows you can copy it over with `scp Patchrack_v0.3.1.zip you@server:~`.
 2. Unpack it into a separate folder, next to your installation:
 
    ```bash
    cd ~
    rm -rf patchrack-update
-   unzip -q Patchrack_v0.3.0.zip -d patchrack-update
+   unzip -q Patchrack_v0.3.1.zip -d patchrack-update
    ```
 
 3. Run the update script from the new release, and give it your Patchrack folder:
@@ -347,7 +347,19 @@ PATCHRACK_DATA=./data PATCHRACK_SECRET=dev-only-secret-not-for-real-use-01234567
   uvicorn app.main:app --reload --port 8080
 ```
 
-The backend is Python (FastAPI, asyncssh). The frontend is plain HTML, CSS and JavaScript in `app/static`, with no build step. Pushing a tag such as `v0.1.0` builds and publishes the image through GitHub Actions.
+The backend is Python (FastAPI, asyncssh). The frontend is plain HTML, CSS and JavaScript in `app/static`, with no build step.
+
+### Releasing
+
+A release happens by itself: when a push to `main` contains a `VERSION` in `app/main.py` that has no release yet, the Release workflow runs the tests, publishes the image to `ghcr.io/homelabclub/patchrack`, and creates the tag `vX.Y.Z` and the GitHub release with `Patchrack_vX.Y.Z.zip` and the newest `CHANGELOG.md` section as notes. Pushes that keep the version only run CI.
+
+To publish a new version from a `Patchrack_vX.Y.Z.zip` on Windows, run in your repository folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\publish.ps1
+```
+
+It takes the newest `Patchrack_v*.zip` from Downloads (or `-Zip <file>`), makes the repository match it, shows what changed, and commits and pushes after you confirm. It stops without changing anything when the repository has uncommitted changes, the version is already released, or a secret would be uploaded.
 
 ## License
 

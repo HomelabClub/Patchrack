@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1 (2026-11-17)
+
+- After an update, the browser now always loads the new interface. Before, it could keep using the previous version's files for hours, so new features didn't show until a hard refresh.
+- `/healthz` also reports the running version.
+- Releasing is simpler: a push to `main` with a new `VERSION` releases by itself (tests, image, tag, GitHub release); no more tag commands.
+- `scripts/publish.ps1` publishes a Patchrack zip from Windows in one command: it updates the repository from the zip, checks it, and pushes.
+- A test that depended on timing failed on GitHub's runners; it now uses a server of its own.
+
 ## 0.3.0 (2026-11-16)
 
 Automatic updates.

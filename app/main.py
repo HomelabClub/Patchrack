@@ -14,7 +14,7 @@ from pathlib import Path
 
 import asyncssh
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
@@ -28,7 +28,7 @@ logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
 log = logging.getLogger("patchrack")
 logging.getLogger("asyncssh").setLevel(logging.WARNING)
 STATIC = Path(__file__).parent / "static"
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 # Where the source code of this build lives. AGPL section 13 asks that people using a
 # (modified) copy over the network can get its source, so the app links to it.
 SOURCE_URL = os.environ.get("PATCHRACK_SOURCE_URL", "").strip()
@@ -803,14 +803,26 @@ PATCHRACK"""
 
 
 # ---- frontend ---------------------------------------------------------------------------
-app.mount("/static", StaticFiles(directory=STATIC), name="static")
+class _RevalidatedStatic(StaticFiles):
+    """Browsers must ask before reusing a file, so an update shows up right away (a 304 when unchanged)."""
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+app.mount("/static", _RevalidatedStatic(directory=STATIC), name="static")
+# the page names the version in its script and style links, so a new version is always fetched
+_INDEX = ((STATIC / "index.html").read_text()
+          .replace('/static/app.css"', f'/static/app.css?v={VERSION}"')
+          .replace('/static/app.js"', f'/static/app.js?v={VERSION}"'))
 
 
 @app.get("/healthz")
 def health():
-    return {"ok": True}
+    return {"ok": True, "version": VERSION}
 
 
 @app.get("/{path:path}")
 def spa(path: str):
-    return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
+    return HTMLResponse(_INDEX, headers={"Cache-Control": "no-cache"})
